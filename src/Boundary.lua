@@ -210,12 +210,30 @@ local function maxResidual(pts: {P2}, idx: {number}, c: P2, d: P2): number
 end
 
 --------------------------------------------------------------------------
--- STEP 1 — layers by connectivity, never by height band
+-- STEP 1 — layers by connectivity AND 2D injectivity, never by height band
 --
 -- A height slice would put a balcony and the courtyard beneath it in the same
--- layer and corrupt everything downstream. Connectivity also handles a spiral
--- ramp passing over itself for free: it is one component that simply never
--- becomes adjacent to itself.
+-- layer and corrupt everything downstream, so connectivity is the right primary
+-- relation. But connectivity ALONE is not enough, and the reason is not exotic.
+--
+-- The claim it replaced was that a balcony over a courtyard is safe because the
+-- two are separate components. That is true only while they are disconnected.
+-- Put a ramp between them -- the ordinary case, and the case this pipeline
+-- exists to handle -- and they are one component, which then gets flattened
+-- into ONE 2D raster where both floors compete for the same "x:z" key. The
+-- loser is silently dropped and every stage downstream reads a floor plan that
+-- is part ground and part balcony.
+--
+-- That is not a corner case. On SmallMap it was 17.9% of the largest layer,
+-- every one of those cells holding heights more than 5 studs apart and 6243 of
+-- them more than 10 apart, worst pair 36.5 studs.
+--
+-- So a layer is grown under BOTH constraints: a cell may join only if it is
+-- adjacent within the step tolerance AND the layer does not already occupy that
+-- x:z at an incompatible height. Cells refused on the second test are not lost;
+-- they seed the next layer, which is exactly the balcony peeling off the
+-- courtyard. Every layer is now injective on x:z by construction, which is the
+-- precondition the 2D raster in steps 2-8 always silently assumed.
 --------------------------------------------------------------------------
 
 function Boundary.layers(floorData: any, cfg: Config?)
@@ -243,18 +261,32 @@ function Boundary.layers(floorData: any, cfg: Config?)
 			local id = #comps + 1
 			local members = { i }
 			nodes[i].comp = id
+			-- the height this layer has claimed at each x:z. Its existence is what
+			-- keeps the layer injective, and injectivity is what makes the 2D
+			-- raster downstream mean anything.
+			local claimed: {[string]: number} = {}
+			claimed[nodes[i].ix .. ":" .. nodes[i].iz] = nodes[i].y
 			local queue, head = { i }, 1
 			while head <= #queue do
 				local cur = nodes[queue[head]]; head += 1
 				for _, d in ipairs(DIRS) do
-					local b = at[(cur.ix + d[1]) .. ":" .. (cur.iz + d[2])]
+					local key = (cur.ix + d[1]) .. ":" .. (cur.iz + d[2])
+					local b = at[key]
 					if b then
 						for _, ni in ipairs(b) do
 							local nb = nodes[ni]
 							if nb.comp == 0 and math.abs(nb.y - cur.y) <= c.stepTol then
-								nb.comp = id
-								members[#members + 1] = ni
-								queue[#queue + 1] = ni
+								-- Refuse a cell this layer already holds at another
+								-- height. Refusing is not discarding: nb keeps comp 0
+								-- and seeds a later layer, which is the balcony
+								-- separating itself from the courtyard it is ramped to.
+								local held = claimed[key]
+								if not held or math.abs(held - nb.y) <= c.stepTol then
+									nb.comp = id
+									if not held then claimed[key] = nb.y end
+									members[#members + 1] = ni
+									queue[#queue + 1] = ni
+								end
 							end
 						end
 					end
