@@ -184,6 +184,16 @@ local function fitLine(pts: {P2}, idx: {number}): (P2, P2)
 	else
 		dx, dz = 0, 1
 	end
+	-- ORIENT ALONG TRAVEL. A principal axis has no sign -- PCA is just as happy
+	-- to hand back the reverse direction -- but everything downstream reads the
+	-- sign as meaning something. outwardOf() assumes interior-on-the-left, which
+	-- is only true if dir runs the way the loop was walked; a flipped segment
+	-- gets its "outward" normal pointing INTO the floor, so step 5 biases the
+	-- wrong way and step 6 offsets outward, straight through the wall it was
+	-- supposed to stand off from. Point it along the run's own span.
+	local sxs = pts[idx[n]].x - pts[idx[1]].x
+	local szs = pts[idx[n]].z - pts[idx[1]].z
+	if dx * sxs + dz * szs < 0 then dx, dz = -dx, -dz end
 	local m = math.sqrt(dx * dx + dz * dz)
 	if m < 1e-12 then dx, dz, m = 1, 0, 1 end
 	return { x = cx, z = cz }, { x = dx / m, z = dz / m }
