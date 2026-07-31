@@ -439,7 +439,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 	local stats = {
 		cells = #nodes, layers = #comps, regions = 0, holes = 0,
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
-		rawRings = 0,
+		rawRings = 0, tinyRegions = 0,
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		severed = 0, severedLayers = 0, annihilated = 0, droppedCells = 0,
 		worstResidual = 0,
@@ -523,7 +523,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 				a2 += p.x * q.z - q.x * p.z
 			end
 			stats.rawRings += 1
-			rings[#rings + 1] = { pts = vs, area = a2 * 0.5 }
+			rings[#rings + 1] = { pts = vs, area = a2 * 0.5, raw = true }
 		end
 
 		for _, loop in ipairs(loops) do
@@ -650,6 +650,17 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		local outer = rings[1]
 		for _, r in ipairs(rings) do
 			if math.abs(r.area) > math.abs(outer.area) then outer = r end
+		end
+		-- The raw fallback expands a ring away from its own centre, which is the
+		-- safe direction for a HOLE (an obstacle that comes out too big costs
+		-- nothing) and exactly the wrong one for an OUTER ring, where it would
+		-- hand back more walkable ground than exists. A ring that could not be
+		-- segmented is at most a couple of studs across, so as an outer ring it
+		-- describes a ledge no agent of radius r could stand on. Drop the region
+		-- and count it: removing ground is erosion, and erosion is always safe.
+		if outer.raw then
+			stats.tinyRegions += 1
+			continue
 		end
 		local holes = {}
 		for _, r in ipairs(rings) do if r ~= outer then holes[#holes + 1] = r end end
