@@ -706,9 +706,17 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 
 		-- height for a vertex: the nearest cell of THIS layer. Vertical accuracy
 		-- is already exact per cell, so nothing is interpolated across a step.
+		-- A vertex is offset off its own cells by up to the agent radius, and a raw
+		-- ring is expanded further still, so it can easily land on a cell this
+		-- layer does not own. The old last resort was cells[1].y -- an arbitrary
+		-- member of the layer, which on a layer spanning 15 studs of ramp is an
+		-- arbitrary height. That is what drew the vertical fences at the wall
+		-- bases: one vertex of a flat ring teleporting to whatever height cell 1
+		-- happened to sit at. Search wider, then fall back to the genuinely
+		-- nearest cell rather than the first one.
 		local function heightAt(p: P2): number
 			local bx, bz = math.floor(p.x), math.floor(p.z)
-			for rad = 0, 3 do
+			for rad = 0, 8 do
 				local best, bestD = nil, math.huge
 				for dx = -rad, rad do
 					for dz = -rad, rad do
@@ -724,7 +732,12 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 				end
 				if best then return best end
 			end
-			return cells[1].y
+			local best, bestD = cells[1].y, math.huge
+			for _, cell in ipairs(cells) do
+				local d = (cell.ix + 0.5 - p.x) ^ 2 + (cell.iz + 0.5 - p.z) ^ 2
+				if d < bestD then best, bestD = cell.y, d end
+			end
+			return best
 		end
 		local function toWorld(ring: any): {Vector3}
 			local out = {}
