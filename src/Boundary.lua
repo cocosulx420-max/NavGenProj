@@ -1,0 +1,752 @@
+--!strict
+-- NavGen.Boundary — clean outlines from the surfel grid alone.
+--
+-- WHAT PROBLEM THIS SOLVES, PRECISELY. The floor stage raycasts DOWN onto the
+-- real part for every cell, so heights are already exact: ramps come out smooth
+-- and stair risers stay crisp. There is no vertical staircase in this pipeline.
+-- What is left is the XZ OUTLINE. Cells are axis-aligned and walls are not, so
+-- a rotated wall leaves a jagged run of cells along its base. That jaggedness is
+-- what inflates polygon counts and manufactures junk portals.
+--
+-- THE RULE THIS MODULE OBEYS: it never asks a Part anything. No raycasts, no
+-- overlap queries, no CFrames, no face planes. The only contact with real
+-- geometry in the whole chain is the raycast the floor stage already paid for.
+-- Everything here is arithmetic on the surfel grid.
+--
+-- That is the entire reason it survives real maps. The previous approach needed
+-- a readable planar face with a usable CFrame to steal a line from — which a
+-- Union or a MeshPart does not have, and which interpenetrating parts corrupt.
+-- A raycast does not care what it hit.
+--
+-- THE STAIRCASE DIES IN STEP 4. A best-fit line is grown along the boundary
+-- cells while the MAXIMUM perpendicular residual stays under a stud. The cells
+-- of a rotated wall's staircase all sit within a stud of one straight line at
+-- the true angle, so they collapse into a single segment and the fit recovers
+-- the angle without ever being told it. Corners are then a BYPRODUCT — they are
+-- where the fit fails — rather than something detected separately against real
+-- geometry, which is what every previous attempt died of.
+--
+-- SAFETY PROPERTY, and it is structural rather than tuned: the only morphology
+-- here is EROSION. Cells are never dilated, and the offset only ever moves a
+-- line inward. Erosion can remove walkable ground but it can never invent
+-- connectivity, so no amount of it can weld two rooms through a wall. A
+-- dilate-then-erode close would bridge any wall thinner than its kernel, which
+-- is the through-wall portal bug manufactured on purpose. It is not used here
+-- and must not be added.
+
+local Boundary = {}
+
+export type Config = {
+	-- Layer separation. Two adjacent cells are the same layer when their height
+	-- difference is under this. It must EXCEED the rise across one cell on the
+	-- steepest walkable slope -- tan(65 deg) = 2.14 -- or every steep ramp
+	-- shatters into one layer per cell.
+	stepTol: number?,
+	minClearance: number?,
+
+	-- Greedy fit. The maximum perpendicular distance a boundary cell centre may
+	-- sit from its segment's line. One cell: anything the raster can express as
+	-- "straight" is straight.
+	fitTol: number?,
+
+	-- Inward offset. Pushed by clamp(maxD - margin, 0, agentRadius), GRADED
+	-- rather than switched: a hard "skip the offset when the corridor is narrow"
+	-- makes two adjacent polygons straddling the threshold offset by r and by 0,
+	-- so they no longer share an edge. Grading is continuous, and narrow
+	-- corridors keep their walkable area instead of vanishing.
+	agentRadius: number?,
+	margin: number?,
+
+	-- Cleanup. Merging happens BEFORE corners are intersected: two very short
+	-- adjacent segments are nearly parallel, and their intersection is then
+	-- numerically unstable.
+	minSegLen: number?,
+	collinearDeg: number?,
+
+	-- Acute corners send two offset lines' intersection arbitrarily far out --
+	-- the classic miter spike. Past this distance from the corner it replaces,
+	-- bevel instead.
+	miterLimit: number?,
+}
+
+local DEFAULT = {
+	stepTol = 2.2,
+	minClearance = 1.5,
+	fitTol = 1.0,
+	agentRadius = 1.5,
+	margin = 0.5,
+	minSegLen = 1.0,
+	collinearDeg = 5,
+	miterLimit = 3.0,
+}
+
+local function merged(cfg): any
+	local c = {}
+	for k, v in pairs(DEFAULT) do c[k] = v end
+	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
+	return c
+end
+
+local INF = 1e20
+
+--------------------------------------------------------------------------
+-- STEP 2 — exact Euclidean distance transform (Felzenszwalb & Huttenlocher)
+--
+-- It must be TRUE Euclidean. Stepping over 4-neighbours gives a diamond kernel
+-- and 8-neighbours a square one, so an offset derived from either comes out
+-- wrong on the diagonals -- which is exactly where the rotated walls are.
+--------------------------------------------------------------------------
+
+local function edt1d(f: {number}, n: number): {number}
+	local v, z, d = table.create(n, 0), table.create(n + 1, 0), table.create(n, 0)
+	local k = 1
+	v[1] = 1; z[1] = -INF; z[2] = INF
+	for q = 2, n do
+		local s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k])
+		while s <= z[k] do
+			k -= 1
+			s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k])
+		end
+		k += 1; v[k] = q; z[k] = s; z[k + 1] = INF
+	end
+	k = 1
+	for q = 1, n do
+		while z[k + 1] < q do k += 1 end
+		local dq = q - v[k]
+		d[q] = dq * dq + f[v[k]]
+	end
+	return d
+end
+
+-- `inside(i, j)` over a w x h raster -> squared distance to the nearest cell
+-- that is NOT inside.
+local function edt2d(w: number, h: number, inside: (number, number) -> boolean): {number}
+	local g = table.create(w * h, 0)
+	local col = table.create(h, 0)
+	for i = 1, w do
+		for j = 1, h do col[j] = inside(i, j) and INF or 0 end
+		local d = edt1d(col, h)
+		for j = 1, h do g[(j - 1) * w + i] = d[j] end
+	end
+	local row = table.create(w, 0)
+	for j = 1, h do
+		local base = (j - 1) * w
+		for i = 1, w do row[i] = g[base + i] end
+		local d = edt1d(row, w)
+		for i = 1, w do g[base + i] = d[i] end
+	end
+	return g
+end
+
+--------------------------------------------------------------------------
+-- small 2D helpers, all in world XZ
+--------------------------------------------------------------------------
+
+type P2 = { x: number, z: number }
+
+local function sub(a: P2, b: P2): P2 return { x = a.x - b.x, z = a.z - b.z } end
+local function dot(a: P2, b: P2): number return a.x * b.x + a.z * b.z end
+local function len(a: P2): number return math.sqrt(a.x * a.x + a.z * a.z) end
+
+-- Interior lies to the LEFT of travel, so this is the outward side.
+local function outwardOf(d: P2): P2
+	local m = len(d)
+	if m < 1e-9 then return { x = 0, z = 0 } end
+	return { x = d.z / m, z = -d.x / m }
+end
+
+-- Total least squares: the principal axis of the point set. NOT ordinary least
+-- squares -- a boundary run can be near-vertical in XZ, where fitting z as a
+-- function of x blows up.
+--
+-- It takes an explicit list of point INDICES rather than a range: the run that
+-- straddles the loop's arbitrary start point wraps, and a range cannot express
+-- that.
+local function fitLine(pts: {P2}, idx: {number}): (P2, P2)
+	local n = #idx
+	local sx, sz = 0, 0
+	for _, i in ipairs(idx) do sx += pts[i].x; sz += pts[i].z end
+	local cx, cz = sx / n, sz / n
+	local sxx, szz, sxz = 0, 0, 0
+	for _, i in ipairs(idx) do
+		local dx, dz = pts[i].x - cx, pts[i].z - cz
+		sxx += dx * dx; szz += dz * dz; sxz += dx * dz
+	end
+	-- larger eigenvalue of the 2x2 covariance, closed form
+	local tr, det = sxx + szz, sxx * szz - sxz * sxz
+	local disc = math.max(tr * tr * 0.25 - det, 0)
+	local lam = tr * 0.5 + math.sqrt(disc)
+	local dx, dz
+	if math.abs(sxz) > 1e-12 then
+		dx, dz = lam - szz, sxz
+	elseif sxx >= szz then
+		dx, dz = 1, 0
+	else
+		dx, dz = 0, 1
+	end
+	local m = math.sqrt(dx * dx + dz * dz)
+	if m < 1e-12 then dx, dz, m = 1, 0, 1 end
+	return { x = cx, z = cz }, { x = dx / m, z = dz / m }
+end
+
+local function maxResidual(pts: {P2}, idx: {number}, c: P2, d: P2): number
+	local nx, nz = -d.z, d.x
+	local worst = 0
+	for _, i in ipairs(idx) do
+		local r = math.abs((pts[i].x - c.x) * nx + (pts[i].z - c.z) * nz)
+		if r > worst then worst = r end
+	end
+	return worst
+end
+
+--------------------------------------------------------------------------
+-- STEP 1 — layers by connectivity, never by height band
+--
+-- A height slice would put a balcony and the courtyard beneath it in the same
+-- layer and corrupt everything downstream. Connectivity also handles a spiral
+-- ramp passing over itself for free: it is one component that simply never
+-- becomes adjacent to itself.
+--------------------------------------------------------------------------
+
+function Boundary.layers(floorData: any, cfg: Config?)
+	local c = merged(cfg)
+
+	local nodes: {any} = {}
+	local at: {[string]: {number}} = {}
+	for k, bucket in pairs(floorData.index) do
+		for _, s in ipairs(bucket) do
+			if s.clearance >= c.minClearance then
+				local p = s.pos
+				local ix, iz = math.floor(p.X), math.floor(p.Z)
+				nodes[#nodes + 1] = { ix = ix, iz = iz, y = p.Y, surfel = s, comp = 0 }
+				local b = at[k]
+				if not b then b = {}; at[k] = b end
+				b[#b + 1] = #nodes
+			end
+		end
+	end
+
+	local DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+	local comps: {any} = {}
+	for i = 1, #nodes do
+		if nodes[i].comp == 0 then
+			local id = #comps + 1
+			local members = { i }
+			nodes[i].comp = id
+			local queue, head = { i }, 1
+			while head <= #queue do
+				local cur = nodes[queue[head]]; head += 1
+				for _, d in ipairs(DIRS) do
+					local b = at[(cur.ix + d[1]) .. ":" .. (cur.iz + d[2])]
+					if b then
+						for _, ni in ipairs(b) do
+							local nb = nodes[ni]
+							if nb.comp == 0 and math.abs(nb.y - cur.y) <= c.stepTol then
+								nb.comp = id
+								members[#members + 1] = ni
+								queue[#queue + 1] = ni
+							end
+						end
+					end
+				end
+			end
+			comps[id] = members
+		end
+	end
+
+	return nodes, comps
+end
+
+--------------------------------------------------------------------------
+-- STEP 3 — trace the contour
+--
+-- From where SURFELS end, never from SVO solid voxels: the octree is
+-- deliberately conservative and would inflate the outline by up to a leaf.
+--
+-- Walls and cliff edges are captured identically -- both are just "floor stops
+-- here" -- so there is no special case for either.
+--
+-- Boundary EDGES are chained rather than boundary cells walked, because the
+-- boundary of a set of cells is a closed loop by construction: there is no open
+-- end to chase and no tolerance involved. The ordered cells for the fit fall
+-- out of the edge order.
+--------------------------------------------------------------------------
+
+local function traceLoops(member: {[string]: boolean}, cells: {any})
+	local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
+	-- lattice corners of cell (x,z)'s edge in direction di, oriented so the loop
+	-- runs with the interior on its left
+	local function corners(x: number, z: number, di: number)
+		if di == 1 then return { x + 1, z }, { x + 1, z + 1 }
+		elseif di == 2 then return { x + 1, z + 1 }, { x, z + 1 }
+		elseif di == 3 then return { x, z + 1 }, { x, z }
+		else return { x, z }, { x + 1, z } end
+	end
+
+	local segs: {any} = {}
+	local byStart: {[string]: {any}} = {}
+	for _, cell in ipairs(cells) do
+		for di, d in ipairs(DIRS) do
+			if not member[(cell.ix + d[1]) .. ":" .. (cell.iz + d[2])] then
+				local a, b = corners(cell.ix, cell.iz, di)
+				local s = { a = a, b = b, cell = cell }
+				segs[#segs + 1] = s
+				local k = a[1] .. "," .. a[2]
+				local bucket = byStart[k]
+				if not bucket then bucket = {}; byStart[k] = bucket end
+				bucket[#bucket + 1] = s
+			end
+		end
+	end
+
+	local used: {[any]: boolean} = {}
+	local loops: {{any}} = {}
+	for _, s0 in ipairs(segs) do
+		if not used[s0] then
+			local loop, cur = {}, s0
+			while cur and not used[cur] do
+				used[cur] = true
+				loop[#loop + 1] = cur
+				local cands = byStart[cur.b[1] .. "," .. cur.b[2]]
+				local nxt = nil
+				if cands then
+					for _, s in ipairs(cands) do
+						if not used[s] then nxt = s; break end
+					end
+				end
+				cur = nxt
+			end
+			if #loop >= 4 then loops[#loops + 1] = loop end
+		end
+	end
+	return loops
+end
+
+--------------------------------------------------------------------------
+-- STEPS 4-8 — one loop of boundary cells to a clean polygon
+--------------------------------------------------------------------------
+
+local function segmentLoop(pts: {P2}, c: any)
+	local n = #pts
+	local segs: {any} = {}
+	local cur = { 1 }
+	for i = 2, n do
+		local trial = table.clone(cur)
+		trial[#trial + 1] = i
+		local cen, dir = fitLine(pts, trial)
+		-- MAXIMUM residual, never the average: an average lets a shallow corner
+		-- hide inside a long run, which is precisely the corner worth keeping.
+		if maxResidual(pts, trial, cen, dir) > c.fitTol then
+			-- The fit just failed. Close the run and start a new one AT this
+			-- point, so the two segments share it. A corner is this failure --
+			-- a byproduct, not something detected separately against geometry.
+			local ce, de = fitLine(pts, cur)
+			segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+			cur = { i - 1, i }
+		else
+			cur = trial
+		end
+	end
+	local ce, de = fitLine(pts, cur)
+	segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+	return segs
+end
+
+local function spanLength(pts: {P2}, idx: {number}): number
+	return len(sub(pts[idx[#idx]], pts[idx[1]]))
+end
+
+-- STEP 8. Greedy segmentation is order dependent and the start point on a
+-- closed loop is arbitrary, so there is always a spurious corner wherever the
+-- walk began: test the first and last segments for collinearity and merge. Then
+-- absorb segments too short to be real. Both must happen BEFORE corners are
+-- intersected.
+local function mergeSegments(pts: {P2}, segs: {any}, c: any)
+	local cosLim = math.cos(math.rad(c.collinearDeg))
+
+	-- merge a into b, keeping every point of both, and refuse if the combined
+	-- run is no longer straight
+	local function refit(a: any, b: any): any?
+		local idx = table.clone(a.idx)
+		local seen: {[number]: boolean} = {}
+		for _, i in ipairs(idx) do seen[i] = true end
+		for _, i in ipairs(b.idx) do
+			if not seen[i] then idx[#idx + 1] = i; seen[i] = true end
+		end
+		local cen, dir = fitLine(pts, idx)
+		if maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
+		return { idx = idx, cen = cen, dir = dir }
+	end
+
+	-- SEAM. The walk's start point on a closed loop is arbitrary, so a straight
+	-- run that happens to straddle it is always split in two -- a spurious
+	-- corner at exactly the place nothing happened.
+	if #segs >= 2 then
+		local first, last = segs[1], segs[#segs]
+		if math.abs(dot(first.dir, last.dir)) >= cosLim then
+			local m = refit(last, first)
+			if m then
+				segs[1] = m
+				segs[#segs] = nil
+			end
+		end
+	end
+
+	-- Near-collinear and too-short runs, absorbed until nothing changes. Curved
+	-- geometry would otherwise shatter into dozens of tiny pieces, and short
+	-- pieces are also what makes the corner intersection unstable -- which is
+	-- why this runs BEFORE any corner is computed.
+	local changed = true
+	while changed and #segs > 3 do
+		changed = false
+		for k = 1, #segs do
+			local a, b = segs[k], segs[(k % #segs) + 1]
+			if a == b then break end
+			local nearly = math.abs(dot(a.dir, b.dir)) >= cosLim
+			local tiny = spanLength(pts, a.idx) < c.minSegLen
+				or spanLength(pts, b.idx) < c.minSegLen
+			if nearly or tiny then
+				local m = refit(a, b)
+				if m then
+					segs[k] = m
+					table.remove(segs, (k % #segs) + 1)
+					changed = true
+					break
+				end
+			end
+		end
+	end
+	return segs
+end
+
+--------------------------------------------------------------------------
+
+function Boundary.fromFloor(floorData: any, cfg: Config?)
+	local c = merged(cfg)
+	local t0 = os.clock()
+	local nodes, comps = Boundary.layers(floorData, cfg)
+
+	local stats = {
+		cells = #nodes, layers = #comps, regions = 0, holes = 0,
+		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
+		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
+		severed = 0, severedLayers = 0, droppedCells = 0,
+		worstResidual = 0,
+	}
+	local regions: {any} = {}
+
+	for ci, members in ipairs(comps) do
+		-- the layer's own cell mask. A cell can appear twice only where a ramp
+		-- spirals over itself inside ONE layer; the mask merges them, which is a
+		-- known limit of working in a 2D raster and is recorded, not hidden.
+		local member: {[string]: boolean} = {}
+		local cells: {any} = {}
+		local cellY: {[string]: number} = {}
+		local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+		for _, ni in ipairs(members) do
+			local nd = nodes[ni]
+			local k = nd.ix .. ":" .. nd.iz
+			if not member[k] then
+				member[k] = true
+				cells[#cells + 1] = nd
+				cellY[k] = nd.y
+			end
+			if nd.ix < minX then minX = nd.ix end
+			if nd.ix > maxX then maxX = nd.ix end
+			if nd.iz < minZ then minZ = nd.iz end
+			if nd.iz > maxZ then maxZ = nd.iz end
+		end
+		if #cells < 3 then continue end
+
+		------------------------------------------------------------------
+		-- STEP 2 — distance transform over this layer
+		------------------------------------------------------------------
+		local ox, oz = minX - 1, minZ - 1
+		local w, h = (maxX - minX) + 3, (maxZ - minZ) + 3
+		local g = edt2d(w, h, function(i, j)
+			return member[(ox + i - 1) .. ":" .. (oz + j - 1)] == true
+		end)
+		local function distAt(ix: number, iz: number): number
+			local i, j = ix - ox + 1, iz - oz + 1
+			if i < 1 or i > w or j < 1 or j > h then return 0 end
+			return math.sqrt(g[(j - 1) * w + i])
+		end
+
+		------------------------------------------------------------------
+		-- STEP 3 — contour
+		------------------------------------------------------------------
+		local loops = traceLoops(member, cells)
+		local rings: {any} = {}
+
+		for _, loop in ipairs(loops) do
+			-- ordered boundary cell centres. A corner cell contributes two edges;
+			-- the duplicate carries no information, so collapse it.
+			local pts: {P2} = {}
+			local owners: {any} = {}
+			local lastCell = nil
+			for _, s in ipairs(loop) do
+				if s.cell ~= lastCell then
+					pts[#pts + 1] = { x = s.cell.ix + 0.5, z = s.cell.iz + 0.5 }
+					owners[#owners + 1] = s.cell
+					lastCell = s.cell
+				end
+			end
+			if #pts < 3 then continue end
+
+			--------------------------------------------------------------
+			-- STEP 4 — greedy line fit. THE STAIRCASE DIES HERE.
+			--------------------------------------------------------------
+			local segs = segmentLoop(pts, c)
+			stats.rawSegments += #segs
+			segs = mergeSegments(pts, segs, c)
+			stats.segments += #segs
+			if #segs < 3 then continue end
+
+			--------------------------------------------------------------
+			-- STEPS 5 + 6 — bias inward, then offset inward, graded
+			--------------------------------------------------------------
+			local lines: {any} = {}
+			for _, s in ipairs(segs) do
+				local out = outwardOf(s.dir)
+				-- STEP 5. Translate the line inward until no accepted cell centre
+				-- lies outward of it. Without this a fit can sit OUTWARD of the
+				-- true wall and eat into the clearance margin, making the safety
+				-- guarantee probabilistic instead of exact.
+				local cval, maxD = -math.huge, 0
+				for _, i in ipairs(s.idx) do
+					local p = pts[i]
+					local v = p.x * out.x + p.z * out.z
+					if v > cval then cval = v end
+					local d = distAt(owners[i].ix, owners[i].iz)
+					if d > maxD then maxD = d end
+				end
+				local r = maxResidual(pts, s.idx, s.cen, s.dir)
+				if r > stats.worstResidual then stats.worstResidual = r end
+
+				-- STEP 6, graded: no threshold, so adjacent polygons on either
+				-- side of a narrowing still agree on where the boundary is.
+				local push = math.clamp(maxD - c.margin, 0, c.agentRadius)
+				stats.offsetSum += push
+				if push < stats.offsetMin then stats.offsetMin = push end
+				if push > stats.offsetMax then stats.offsetMax = push end
+
+				lines[#lines + 1] = {
+					n = out, c = cval - push, dir = s.dir,
+					anchor = pts[s.idx[#s.idx]], class = "boundary",
+				}
+			end
+
+			--------------------------------------------------------------
+			-- STEP 7 — corners are the intersections of adjacent offset lines
+			--
+			-- Sub-cell accurate, and sharper than the raster could ever be. This
+			-- is also why lines are offset rather than cells eroded up front:
+			-- eroding first bevels every convex corner into a small arc, which
+			-- the segmenter then reads as two or three short segments instead of
+			-- one corner -- more polygons, the opposite of the goal.
+			--------------------------------------------------------------
+			local verts: {P2} = {}
+			local nL = #lines
+			for i = 1, nL do
+				local l1, l2 = lines[i], lines[(i % nL) + 1]
+				local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
+				local anchor = l1.anchor
+				if math.abs(det) < 1e-6 then
+					-- near-parallel: fall back to the foot of the anchor on l1
+					stats.unstableCorners += 1
+					local s = l1.c - (anchor.x * l1.n.x + anchor.z * l1.n.z)
+					verts[#verts + 1] = { x = anchor.x + l1.n.x * s, z = anchor.z + l1.n.z * s }
+				else
+					local px = (l1.c * l2.n.z - l2.c * l1.n.z) / det
+					local pz = (l1.n.x * l2.c - l2.n.x * l1.c) / det
+					local d = len(sub({ x = px, z = pz }, anchor))
+					if d > c.miterLimit then
+						-- MITER LIMIT. An acute corner throws the intersection
+						-- arbitrarily far out; bevel across it instead.
+						stats.bevels += 1
+						local s1 = l1.c - (anchor.x * l1.n.x + anchor.z * l1.n.z)
+						verts[#verts + 1] = { x = anchor.x + l1.n.x * s1, z = anchor.z + l1.n.z * s1 }
+						local s2 = l2.c - (anchor.x * l2.n.x + anchor.z * l2.n.z)
+						verts[#verts + 1] = { x = anchor.x + l2.n.x * s2, z = anchor.z + l2.n.z * s2 }
+					else
+						verts[#verts + 1] = { x = px, z = pz }
+					end
+				end
+			end
+			if #verts < 3 then continue end
+
+			-- signed area in XZ decides outer vs hole. Magnitude picks the outer
+			-- ring, never the sign: this project has been bitten by a handedness
+			-- assumption before.
+			local a2 = 0
+			for i = 1, #verts do
+				local p, q = verts[i], verts[(i % #verts) + 1]
+				a2 += p.x * q.z - q.x * p.z
+			end
+			rings[#rings + 1] = { pts = verts, area = a2 * 0.5 }
+		end
+
+		if #rings == 0 then continue end
+		local outer = rings[1]
+		for _, r in ipairs(rings) do
+			if math.abs(r.area) > math.abs(outer.area) then outer = r end
+		end
+		local holes = {}
+		for _, r in ipairs(rings) do if r ~= outer then holes[#holes + 1] = r end end
+
+		-- height for a vertex: the nearest cell of THIS layer. Vertical accuracy
+		-- is already exact per cell, so nothing is interpolated across a step.
+		local function heightAt(p: P2): number
+			local bx, bz = math.floor(p.x), math.floor(p.z)
+			for rad = 0, 3 do
+				local best, bestD = nil, math.huge
+				for dx = -rad, rad do
+					for dz = -rad, rad do
+						if math.max(math.abs(dx), math.abs(dz)) == rad then
+							local k = (bx + dx) .. ":" .. (bz + dz)
+							local y = cellY[k]
+							if y then
+								local d = (bx + dx + 0.5 - p.x) ^ 2 + (bz + dz + 0.5 - p.z) ^ 2
+								if d < bestD then best, bestD = y, d end
+							end
+						end
+					end
+				end
+				if best then return best end
+			end
+			return cells[1].y
+		end
+		local function toWorld(ring: any): {Vector3}
+			local out = {}
+			for i, p in ipairs(ring.pts) do out[i] = Vector3.new(p.x, heightAt(p), p.z) end
+			return out
+		end
+
+		local region = {
+			layer = ci,
+			verts = toWorld(outer),
+			holes = {},
+			area = math.abs(outer.area),
+			cells = #cells,
+		}
+		for _, hr in ipairs(holes) do
+			region.holes[#region.holes + 1] = { verts = toWorld(hr), area = math.abs(hr.area) }
+		end
+		regions[#regions + 1] = region
+		stats.regions += 1
+		stats.holes += #region.holes
+
+		------------------------------------------------------------------
+		-- STEP 9 — severance check
+		--
+		-- Mandatory, not optional: this is the ONLY detector for the offset
+		-- having pinched a corridor shut and cut the map in half. Union-find
+		-- over surfel adjacency before and after; anything that loses
+		-- connectivity is reported. Reported, never silently repaired -- a
+		-- severed layer is a tuning failure and must be visible as one.
+		------------------------------------------------------------------
+		local function inRing(ring: {P2}, x: number, z: number): boolean
+			local inside = false
+			local n = #ring
+			local j = n
+			for i = 1, n do
+				local a, b = ring[i], ring[j]
+				if (a.z > z) ~= (b.z > z) then
+					local t = (z - a.z) / (b.z - a.z)
+					if x < a.x + t * (b.x - a.x) then inside = not inside end
+				end
+				j = i
+			end
+			return inside
+		end
+		local kept: {[string]: boolean} = {}
+		local keptList: {any} = {}
+		for _, cell in ipairs(cells) do
+			local x, z = cell.ix + 0.5, cell.iz + 0.5
+			local ok = inRing(outer.pts, x, z)
+			if ok then
+				for _, hr in ipairs(holes) do
+					if inRing(hr.pts, x, z) then ok = false; break end
+				end
+			end
+			if ok then
+				kept[cell.ix .. ":" .. cell.iz] = true
+				keptList[#keptList + 1] = cell
+			end
+		end
+		stats.droppedCells += (#cells - #keptList)
+		local seen: {[string]: boolean} = {}
+		local pieces = 0
+		local D4 = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+		for _, cell in ipairs(keptList) do
+			local k0 = cell.ix .. ":" .. cell.iz
+			if not seen[k0] then
+				seen[k0] = true
+				pieces += 1
+				local queue, head = { cell }, 1
+				while head <= #queue do
+					local cur = queue[head]; head += 1
+					for _, d in ipairs(D4) do
+						local nk = (cur.ix + d[1]) .. ":" .. (cur.iz + d[2])
+						if kept[nk] and not seen[nk] then
+							seen[nk] = true
+							queue[#queue + 1] = { ix = cur.ix + d[1], iz = cur.iz + d[2] }
+						end
+					end
+				end
+			end
+		end
+		if pieces > 1 then
+			stats.severedLayers += 1
+			stats.severed += (pieces - 1)
+			region.severedInto = pieces
+		end
+	end
+
+	if stats.offsetMin == math.huge then stats.offsetMin = 0 end
+	stats.seconds = os.clock() - t0
+	return { regions = regions, stats = stats, config = c }
+end
+
+--------------------------------------------------------------------------
+
+function Boundary.visualize(res: any, parent: Instance?)
+	local root = parent or workspace
+	local old = root:FindFirstChild("NavGen_Boundary")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder")
+	folder.Name = "NavGen_Boundary"
+	folder.Parent = root
+
+	local function bar(a: Vector3, b: Vector3, colour: Color3, thick: number, into: Instance)
+		local d = b - a
+		if d.Magnitude < 1e-4 then return end
+		local p = Instance.new("Part")
+		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+		p.Material = Enum.Material.Neon
+		p.Color = colour
+		p.Size = Vector3.new(thick, thick, d.Magnitude)
+		p.CFrame = CFrame.lookAt(a + d * 0.5, b) + Vector3.new(0, 0.08, 0)
+		p.Parent = into
+	end
+
+	for ri, r in ipairs(res.regions) do
+		local sub = Instance.new("Folder")
+		sub.Name = string.format("R%d_L%d_c%d_h%d%s", ri, r.layer, r.cells, #r.holes,
+			r.severedInto and ("_SEVERED" .. r.severedInto) or "")
+		sub.Parent = folder
+		local v = r.verts
+		for i = 1, #v do
+			bar(v[i], v[(i % #v) + 1], Color3.fromRGB(255, 80, 80), 0.18, sub)
+		end
+		for _, hr in ipairs(r.holes) do
+			local hv = hr.verts
+			for i = 1, #hv do
+				bar(hv[i], hv[(i % #hv) + 1], Color3.fromRGB(80, 200, 255), 0.18, sub)
+			end
+		end
+	end
+	return folder
+end
+
+return Boundary
