@@ -429,6 +429,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 	local stats = {
 		cells = #nodes, layers = #comps, regions = 0, holes = 0,
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
+		rawRings = 0,
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		severed = 0, severedLayers = 0, droppedCells = 0,
 		worstResidual = 0,
@@ -478,6 +479,43 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		local loops = traceLoops(member, cells)
 		local rings: {any} = {}
 
+		-- A ring too small to survive segmentation is still a real obstacle, and
+		-- DISCARDING it is the one operation in this module that can invent
+		-- walkable ground -- an agent would path straight through a 1x2 pillar.
+		-- That breaks the safety property the whole design rests on, so a ring
+		-- that cannot be fitted falls back to its raw lattice outline, expanded
+		-- away from its own centre by the agent radius. Jagged, but an obstacle
+		-- that comes out too big is safe and one that is absent is not.
+		local function emitRaw(loop: {any})
+			local vs: {P2} = {}
+			for _, s in ipairs(loop) do
+				local last = vs[#vs]
+				if not last or last.x ~= s.a[1] or last.z ~= s.a[2] then
+					vs[#vs + 1] = { x = s.a[1], z = s.a[2] }
+				end
+			end
+			if #vs > 1 and vs[1].x == vs[#vs].x and vs[1].z == vs[#vs].z then vs[#vs] = nil end
+			if #vs < 3 then return end
+			local cx, cz = 0, 0
+			for _, p in ipairs(vs) do cx += p.x; cz += p.z end
+			cx, cz = cx / #vs, cz / #vs
+			for _, p in ipairs(vs) do
+				local dx, dz = p.x - cx, p.z - cz
+				local m = math.sqrt(dx * dx + dz * dz)
+				if m > 1e-6 then
+					p.x += dx / m * c.agentRadius
+					p.z += dz / m * c.agentRadius
+				end
+			end
+			local a2 = 0
+			for i = 1, #vs do
+				local p, q = vs[i], vs[(i % #vs) + 1]
+				a2 += p.x * q.z - q.x * p.z
+			end
+			stats.rawRings += 1
+			rings[#rings + 1] = { pts = vs, area = a2 * 0.5 }
+		end
+
 		for _, loop in ipairs(loops) do
 			-- ordered boundary cell centres. A corner cell contributes two edges;
 			-- the duplicate carries no information, so collapse it.
@@ -491,7 +529,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 					lastCell = s.cell
 				end
 			end
-			if #pts < 3 then continue end
+			if #pts < 3 then emitRaw(loop); continue end
 
 			--------------------------------------------------------------
 			-- STEP 4 — greedy line fit. THE STAIRCASE DIES HERE.
@@ -500,7 +538,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 			stats.rawSegments += #segs
 			segs = mergeSegments(pts, segs, c)
 			stats.segments += #segs
-			if #segs < 3 then continue end
+			if #segs < 3 then emitRaw(loop); continue end
 
 			--------------------------------------------------------------
 			-- STEPS 5 + 6 — bias inward, then offset inward, graded
@@ -512,13 +550,25 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 				-- lies outward of it. Without this a fit can sit OUTWARD of the
 				-- true wall and eat into the clearance margin, making the safety
 				-- guarantee probabilistic instead of exact.
+				-- maxD is the LOCAL THICKNESS of the ground behind this line, and it
+				-- has to be measured by marching INWARD. Reading D at the boundary
+				-- cells themselves is worthless: a boundary cell is 4-adjacent to a
+				-- non-walkable cell by construction, so its D is always exactly 1,
+				-- which pins the push at clamp(1 - margin, 0, r) forever. The offset
+				-- then ignores agentRadius entirely and the grading in step 6 is a
+				-- constant. March along the inward normal instead, only as far as
+				-- the clamp can still respond to (r + margin); past that the answer
+				-- cannot change.
+				local reach = math.ceil(c.agentRadius + c.margin)
 				local cval, maxD = -math.huge, 0
 				for _, i in ipairs(s.idx) do
 					local p = pts[i]
 					local v = p.x * out.x + p.z * out.z
 					if v > cval then cval = v end
-					local d = distAt(owners[i].ix, owners[i].iz)
-					if d > maxD then maxD = d end
+					for t = 0, reach do
+						local d = distAt(math.floor(p.x - out.x * t), math.floor(p.z - out.z * t))
+						if d > maxD then maxD = d end
+					end
 				end
 				local r = maxResidual(pts, s.idx, s.cen, s.dir)
 				if r > stats.worstResidual then stats.worstResidual = r end
@@ -573,7 +623,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 					end
 				end
 			end
-			if #verts < 3 then continue end
+			if #verts < 3 then emitRaw(loop); continue end
 
 			-- signed area in XZ decides outer vs hole. Magnitude picks the outer
 			-- ring, never the sign: this project has been bitten by a handedness
