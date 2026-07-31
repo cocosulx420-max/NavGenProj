@@ -441,7 +441,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
 		rawRings = 0,
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
-		severed = 0, severedLayers = 0, droppedCells = 0,
+		severed = 0, severedLayers = 0, annihilated = 0, droppedCells = 0,
 		worstResidual = 0,
 	}
 	local regions: {any} = {}
@@ -756,7 +756,18 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 				end
 			end
 		end
-		if pieces > 1 then
+		-- Counting the pieces of what survives cannot see a layer that did not
+		-- survive at all: annihilation is zero pieces, and `pieces > 1` is false
+		-- for zero exactly as it is for one. A corridor the offset ate whole is
+		-- the most severe version of the failure this check exists for, so it has
+		-- to be the loudest case, not the one that slips past. A 4-stud corridor
+		-- does this on the default tuning: maxD is 2 at the centreline, so both
+		-- sides push the full 1.5 and the two offset lines land on each other.
+		if #keptList == 0 then
+			stats.severedLayers += 1
+			stats.annihilated += 1
+			region.severedInto = 0
+		elseif pieces > 1 then
 			stats.severedLayers += 1
 			stats.severed += (pieces - 1)
 			region.severedInto = pieces

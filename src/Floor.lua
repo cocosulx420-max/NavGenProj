@@ -29,6 +29,7 @@ export type Surfel = {
 export type Config = {
 	leaf: number?, maxSlope: number?, agentHeight: number?,
 	clearCap: number?, maxGroundFootprint: number?, minClearance: number?,
+	root: Instance?, -- restrict the bake to this subtree (default: whole workspace)
 }
 
 local DEFAULT = {
@@ -68,7 +69,10 @@ Floor.cellKey = cellKey
 function Floor.gatherParts(cfg: Config?): {BasePart}
 	local c = merged(cfg)
 	local out = {}
-	for _, d in ipairs(workspace:GetDescendants()) do
+	-- `root` scopes the bake to one model. A test map and the real map usually
+	-- share a place, and baking the whole workspace to look at one of them wastes
+	-- the only expensive stage in the pipeline.
+	for _, d in ipairs((c.root or workspace):GetDescendants()) do
 		if d:IsA("BasePart") and d.CanCollide and d.ClassName ~= "Terrain" and not isCharacter(d) then
 			if math.max(d.Size.X, d.Size.Z) <= c.maxGroundFootprint then
 				table.insert(out, d)
