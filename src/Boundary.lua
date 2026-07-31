@@ -314,7 +314,7 @@ end
 -- out of the edge order.
 --------------------------------------------------------------------------
 
-local function traceLoops(member: {[string]: boolean}, cells: {any})
+local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[string]: number}, stepTol: number)
 	local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
 	-- lattice corners of cell (x,z)'s edge in direction di, oriented so the loop
 	-- runs with the interior on its left
@@ -329,7 +329,15 @@ local function traceLoops(member: {[string]: boolean}, cells: {any})
 	local byStart: {[string]: {any}} = {}
 	for _, cell in ipairs(cells) do
 		for di, d in ipairs(DIRS) do
-			if not member[(cell.ix + d[1]) .. ":" .. (cell.iz + d[2])] then
+			local nk = (cell.ix + d[1]) .. ":" .. (cell.iz + d[2])
+			-- Floor stops here if there is no neighbour OR if the neighbour is a
+			-- cliff away. Membership alone is not the test: a layer is connected
+			-- in 3D, but its 2D projection is not, so a ramp climbing beside the
+			-- floor it started from puts both in one layer with a 15-stud drop
+			-- between cells 1.7 studs apart. Without this the raster reads that
+			-- drop as continuous ground and the polygon spans the cliff.
+			local drop = cellY[nk]
+			if not member[nk] or (drop ~= nil and math.abs(drop - cell.y) > stepTol) then
 				local a, b = corners(cell.ix, cell.iz, di)
 				local s = { a = a, b = b, cell = cell }
 				segs[#segs + 1] = s
@@ -525,7 +533,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		------------------------------------------------------------------
 		-- STEP 3 — contour
 		------------------------------------------------------------------
-		local loops = traceLoops(member, cells)
+		local loops = traceLoops(member, cells, cellY, c.stepTol)
 		local rings: {any} = {}
 
 		-- A ring too small to survive segmentation is still a real obstacle, and
