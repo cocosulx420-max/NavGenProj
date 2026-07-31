@@ -393,7 +393,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	-- corner at exactly the place nothing happened.
 	if #segs >= 2 then
 		local first, last = segs[1], segs[#segs]
-		if math.abs(dot(first.dir, last.dir)) >= cosLim then
+		if dot(first.dir, last.dir) >= cosLim then
 			local m = refit(last, first)
 			if m then
 				segs[1] = m
@@ -412,7 +412,14 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 		for k = 1, #segs do
 			local a, b = segs[k], segs[(k % #segs) + 1]
 			if a == b then break end
-			local nearly = math.abs(dot(a.dir, b.dir)) >= cosLim
+			-- SIGNED, not abs. Directions are oriented along the walk, so an abs
+			-- test calls a 180-degree reversal "collinear" -- and the two long
+			-- sides of a thin wall's ring are exactly that, sitting within fitTol
+			-- of each other because the wall is thinner than the tolerance. They
+			-- merge, the ring falls under three segments, and it collapses to the
+			-- raw fallback. That was 165 of 169 holes on SmallMap: every interior
+			-- wall came out jagged.
+			local nearly = dot(a.dir, b.dir) >= cosLim
 			local tiny = spanLength(pts, a.idx) < c.minSegLen
 				or spanLength(pts, b.idx) < c.minSegLen
 			if nearly or tiny then
