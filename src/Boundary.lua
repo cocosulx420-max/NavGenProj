@@ -647,6 +647,28 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 			end
 			if #pts < 3 then emitRaw(loop); continue end
 
+			-- DESPECKLE THE CLASSIFICATION. The wall/dropoff test is per cell and
+			-- reads a neighbouring column, so it picks up grit: a gap between two
+			-- parts, a wall whose top surfel is missing, a stair nosing. Left
+			-- alone each speck forces the fit to break a run it should have kept,
+			-- and since merging refuses to cross a class change the fragments
+			-- never recombine -- 854 flips along one layer's 2956 boundary edges,
+			-- 38% of them a single edge disagreeing with both its neighbours, and
+			-- the segment count nearly doubled. A lone dissenter surrounded by
+			-- agreement is grit, so let its neighbours outvote it. Real wall/ledge
+			-- transitions are many cells long and unaffected.
+			local nC = #cls
+			if nC >= 3 then
+				for _ = 1, 2 do
+					local prev = table.clone(cls)
+					for i = 1, nC do
+						local a = prev[((i - 2) % nC) + 1]
+						local b = prev[(i % nC) + 1]
+						if a == b and prev[i] ~= a then cls[i] = a end
+					end
+				end
+			end
+
 			--------------------------------------------------------------
 			-- STEP 4 — greedy line fit. THE STAIRCASE DIES HERE.
 			--------------------------------------------------------------
