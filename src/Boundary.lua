@@ -1100,8 +1100,17 @@ function Boundary.visualize(res: any, parent: Instance?)
 			local seg = Instance.new("Folder")
 			seg.Name = string.format("L%d_%d_w%d", l.a, l.b, l.width)
 			seg.Parent = lf
-			bar(l.from + Vector3.new(0, 0.5, 0), l.to + Vector3.new(0, 0.5, 0),
-				Color3.fromRGB(90, 255, 120), 0.45, seg)
+			-- from -> to is one cell step, so drawing that is a bar with no
+			-- length. What matters is how WIDE the opening is: draw it across
+			-- the frontage, perpendicular to the direction of travel.
+			local mid = (l.from + l.to) * 0.5 + Vector3.new(0, 0.5, 0)
+			local step = l.to - l.from
+			local flat = Vector3.new(step.X, 0, step.Z)
+			local across = (flat.Magnitude > 1e-3)
+				and Vector3.new(-flat.Unit.Z, 0, flat.Unit.X)
+				or Vector3.new(1, 0, 0)
+			local half = across * (l.width * 0.5)
+			bar(mid - half, mid + half, Color3.fromRGB(90, 255, 120), 0.5, seg)
 		end
 	end
 	return folder
