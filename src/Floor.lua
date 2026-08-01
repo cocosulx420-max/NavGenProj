@@ -19,6 +19,10 @@ export type Surfel = {
 	slope: number,      -- degrees from world-up
 	clearance: number,  -- studs of headroom above (capped; 0 = embedded/dead space)
 	part: BasePart,     -- the part under this surfel
+	-- A ClipRamp is the smooth surface authored over a staircase. Where one
+	-- exists it IS the walkable surface and the steps beneath it are not; the
+	-- boundary stage drops the risers wherever a clip surfel covers the cell.
+	clip: boolean,
 }
 
 -- NOTE: horizontal "width" (distance to nearest wall) is intentionally NOT baked.
@@ -154,7 +158,7 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				end
 				local surfel: Surfel = {
 					pos = res.Position, normal = n, slope = slope,
-					clearance = clearance, part = res.Instance,
+					clearance = clearance, part = res.Instance, clip = isClip,
 				}
 				surfels[#surfels + 1] = surfel
 				local key = cellKey(cx, cz)

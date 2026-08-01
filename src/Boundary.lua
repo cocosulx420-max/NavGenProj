@@ -241,12 +241,30 @@ function Boundary.layers(floorData: any, cfg: Config?)
 
 	local nodes: {any} = {}
 	local at: {[string]: {number}} = {}
+	-- Every surface height present at each cell, INCLUDING ones filtered out of
+	-- the walkable set. It is what lets a boundary edge be classified without
+	-- asking a Part anything: a wall is a column whose surface is above us, a
+	-- dropoff is one whose surface is below.
+	local allY: {[string]: {number}} = {}
 	for k, bucket in pairs(floorData.index) do
+		local ys = {}
+		for _, s in ipairs(bucket) do ys[#ys + 1] = s.pos.Y end
+		allY[k] = ys
+
+		-- A ClipRamp is the smooth surface authored over a staircase, so where
+		-- one covers a cell it IS the floor and the risers underneath are not.
+		-- Keeping both makes every step its own micro-layer, which is what drew
+		-- the picket fences over both staircases.
+		local hasClip = false
 		for _, s in ipairs(bucket) do
-			if s.clearance >= c.minClearance then
+			if s.clip then hasClip = true; break end
+		end
+
+		for _, s in ipairs(bucket) do
+			if s.clearance >= c.minClearance and not (hasClip and not s.clip) then
 				local p = s.pos
 				local ix, iz = math.floor(p.X), math.floor(p.Z)
-				nodes[#nodes + 1] = { ix = ix, iz = iz, y = p.Y, surfel = s, comp = 0 }
+				nodes[#nodes + 1] = { ix = ix, iz = iz, y = p.Y, surfel = s, comp = 0, clip = s.clip }
 				local b = at[k]
 				if not b then b = {}; at[k] = b end
 				b[#b + 1] = #nodes
@@ -296,7 +314,7 @@ function Boundary.layers(floorData: any, cfg: Config?)
 		end
 	end
 
-	return nodes, comps
+	return nodes, comps, allY
 end
 
 --------------------------------------------------------------------------
@@ -339,7 +357,7 @@ local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[st
 			local drop = cellY[nk]
 			if not member[nk] or (drop ~= nil and math.abs(drop - cell.y) > stepTol) then
 				local a, b = corners(cell.ix, cell.iz, di)
-				local s = { a = a, b = b, cell = cell }
+				local s = { a = a, b = b, cell = cell, nk = nk }
 				segs[#segs + 1] = s
 				local k = a[1] .. "," .. a[2]
 				local bucket = byStart[k]
@@ -376,11 +394,22 @@ end
 -- STEPS 4-8 — one loop of boundary cells to a clean polygon
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any)
+local function segmentLoop(pts: {P2}, c: any, cls: {string})
 	local n = #pts
 	local segs: {any} = {}
 	local cur = { 1 }
 	for i = 2, n do
+		-- A run is wall or it is dropoff, never a blend. They are offset by
+		-- different amounts, so a segment spanning both has no single correct
+		-- push and would have to compromise -- meaning either a wall that is not
+		-- stood off from or a ledge that is eroded. Break the run on the class
+		-- change and let the two halves be fitted separately.
+		if cls[i] ~= cls[cur[1]] then
+			local ce, de = fitLine(pts, cur)
+			segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
+			cur = { i }
+			continue
+		end
 		local trial = table.clone(cur)
 		trial[#trial + 1] = i
 		local cen, dir = fitLine(pts, trial)
@@ -391,14 +420,14 @@ local function segmentLoop(pts: {P2}, c: any)
 			-- point, so the two segments share it. A corner is this failure --
 			-- a byproduct, not something detected separately against geometry.
 			local ce, de = fitLine(pts, cur)
-			segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+			segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
 			cur = { i - 1, i }
 		else
 			cur = trial
 		end
 	end
 	local ce, de = fitLine(pts, cur)
-	segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+	segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
 	return segs
 end
 
@@ -417,6 +446,9 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	-- merge a into b, keeping every point of both, and refuse if the combined
 	-- run is no longer straight
 	local function refit(a: any, b: any): any?
+		-- never across a class change: the merged run would need one push for
+		-- what is wall and another for what is ledge
+		if a.class ~= b.class then return nil end
 		local idx = table.clone(a.idx)
 		local seen: {[number]: boolean} = {}
 		for _, i in ipairs(idx) do seen[i] = true end
@@ -425,7 +457,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 		end
 		local cen, dir = fitLine(pts, idx)
 		if maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
-		return { idx = idx, cen = cen, dir = dir }
+		return { idx = idx, cen = cen, dir = dir, class = a.class }
 	end
 
 	-- SEAM. The walk's start point on a closed loop is arbitrary, so a straight
@@ -481,12 +513,33 @@ end
 function Boundary.fromFloor(floorData: any, cfg: Config?)
 	local c = merged(cfg)
 	local t0 = os.clock()
-	local nodes, comps = Boundary.layers(floorData, cfg)
+	local nodes, comps, allY = Boundary.layers(floorData, cfg)
+
+	-- WALL or DROPOFF. Erosion exists to stop an agent clipping a wall or
+	-- snagging a corner, and a cliff edge is neither -- an agent walking the lip
+	-- of a ledge is fine, and pulling the boundary back from every ledge is what
+	-- ate 12.4% of SmallMap's cells. So only wall boundaries are offset.
+	--
+	-- The test is entirely in the surfel field, no Part consulted: a wall is a
+	-- neighbouring column whose surface stands above us, a dropoff is one whose
+	-- surface lies below. Nothing at all in that column is open air, which is a
+	-- dropoff too. The ambiguous "something at our own height that is not in our
+	-- layer" falls to wall, because over-eroding is safe and under-eroding is not.
+	local function classify(nk: string, y: number): string
+		local ys = allY[nk]
+		if not ys then return "drop" end
+		local below = false
+		for _, h in ipairs(ys) do
+			if h > y + c.stepTol then return "wall" end
+			if h < y - c.stepTol then below = true end
+		end
+		return below and "drop" or "wall"
+	end
 
 	local stats = {
 		cells = #nodes, layers = #comps, regions = 0, holes = 0,
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
-		rawRings = 0, tinyRegions = 0,
+		rawRings = 0, tinyRegions = 0, wallSegments = 0, dropSegments = 0,
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		severed = 0, severedLayers = 0, annihilated = 0, droppedCells = 0,
 		worstResidual = 0,
@@ -578,12 +631,18 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 			-- the duplicate carries no information, so collapse it.
 			local pts: {P2} = {}
 			local owners: {any} = {}
-			local lastCell = nil
+			local cls: {string} = {}
+			local lastCell, lastCls = nil, nil
 			for _, s in ipairs(loop) do
-				if s.cell ~= lastCell then
+				local k = classify(s.nk, s.cell.y)
+				-- collapse the duplicate a corner cell contributes, but ONLY while
+				-- the class holds: a cell with a wall on one side and a ledge on
+				-- the other is two different boundaries and has to stay two points
+				if s.cell ~= lastCell or k ~= lastCls then
 					pts[#pts + 1] = { x = s.cell.ix + 0.5, z = s.cell.iz + 0.5 }
 					owners[#owners + 1] = s.cell
-					lastCell = s.cell
+					cls[#cls + 1] = k
+					lastCell, lastCls = s.cell, k
 				end
 			end
 			if #pts < 3 then emitRaw(loop); continue end
@@ -591,7 +650,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 			--------------------------------------------------------------
 			-- STEP 4 — greedy line fit. THE STAIRCASE DIES HERE.
 			--------------------------------------------------------------
-			local segs = segmentLoop(pts, c)
+			local segs = segmentLoop(pts, c, cls)
 			stats.rawSegments += #segs
 			segs = mergeSegments(pts, segs, c)
 			stats.segments += #segs
@@ -632,14 +691,24 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 
 				-- STEP 6, graded: no threshold, so adjacent polygons on either
 				-- side of a narrowing still agree on where the boundary is.
-				local push = math.clamp(maxD - c.margin, 0, c.agentRadius)
+				--
+				-- A DROPOFF IS NOT OFFSET AT ALL. The offset exists so an agent
+				-- does not clip a wall or snag on a corner; a ledge presents
+				-- neither, and walking its lip is legitimate. Standing off from
+				-- every ledge as though it were a wall is what removed 12.4% of
+				-- SmallMap, and it removes it from exactly the places -- balcony
+				-- rims, platform edges, the tops of stairs -- where the ground is
+				-- narrowest and most worth keeping.
+				local isWall = (s.class or "wall") == "wall"
+				local push = isWall and math.clamp(maxD - c.margin, 0, c.agentRadius) or 0
+				if isWall then stats.wallSegments += 1 else stats.dropSegments += 1 end
 				stats.offsetSum += push
 				if push < stats.offsetMin then stats.offsetMin = push end
 				if push > stats.offsetMax then stats.offsetMax = push end
 
 				lines[#lines + 1] = {
 					n = out, c = cval - push, dir = s.dir,
-					anchor = pts[s.idx[#s.idx]], class = "boundary",
+					anchor = pts[s.idx[#s.idx]], class = s.class or "wall",
 				}
 			end
 
