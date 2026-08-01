@@ -23,15 +23,37 @@ and the `"x:z"` index.
 
 ## The pipeline
 
-### 1. Separate into layers by connectivity, not height
+### 1. Separate into layers by connectivity **and** 2D injectivity
 
 Two adjacent cells belong to the same layer when their height difference is
 under the step tolerance. Label connected components over that relation.
 
 Do not slice by height bands. A balcony over a courtyard would put both in the
-same slice and corrupt everything downstream. Connectivity also handles a spiral
-ramp passing over itself for free — it is one component that simply never
-becomes adjacent to itself.
+same slice and corrupt everything downstream.
+
+**Connectivity alone is not enough, and the reason is not exotic.** This document
+used to claim a balcony over a courtyard was safe because the two are separate
+components. That holds only while they are *disconnected*. Ramp them together —
+the ordinary case, and the case this pipeline exists for — and they are one
+component, which then gets flattened into one 2D raster where both floors
+compete for the same `"x:z"` key. The loser is silently dropped and every stage
+downstream reads a floor plan that is part ground and part balcony.
+
+Measured on SmallMap before the fix: **7038 of 39407 cells in the largest layer
+held two or more heights** — 17.9%, all of them more than 5 studs apart, 6243
+more than 10 apart, worst pair 36.5 studs. The visible result was one
+39407-cell layer whose outer ring was an 8-vertex quad the size of the map
+footprint.
+
+So a cell may join a layer only if it is adjacent within the step tolerance
+**and** the layer does not already occupy that `x:z` at an incompatible height.
+A refused cell is not discarded — it seeds the next layer, which is exactly the
+balcony peeling off the courtyard. Every layer is now injective on `x:z` by
+construction, which is the precondition steps 2–8 always silently assumed.
+
+Where a **ClipRamp** covers a cell it *is* the walkable surface and the steps
+beneath it are not; the risers are dropped. Keeping both makes every step its
+own micro-layer.
 
 Everything from here runs per component.
 
@@ -61,6 +83,13 @@ a leaf.
 This captures walls and cliff edges identically. A cell next to a wall and a
 cell at a rooftop edge are both just "floor stops here". One mechanism, no
 special cases.
+
+**A cliff inside a layer still ends the floor.** Membership is not the test. A
+layer is connected in 3D but its 2D projection need not be: a ramp climbing
+alongside the floor it departed from is one layer, passes the injectivity test,
+and still had cells 1.7 studs apart horizontally sitting 15 studs apart
+vertically. The raster read that drop as walkable ground and ran polygons
+across it. Floor stops at a neighbour that is missing **or a cliff away**.
 
 *Implementation note:* boundary **edges** are chained rather than boundary cells
 walked, because the boundary of a set of cells is a closed loop by construction —
@@ -102,10 +131,34 @@ outward of it.
 Without this a fit can sit outward of the true wall and eat into the clearance
 margin, so the safety guarantee becomes probabilistic. With it, it is exact.
 
-### 6. Offset inward, graded
+### 6. Offset inward, graded — **walls only**
 
-Push each line inward along its normal by `clamp(maxD − margin, 0, r)`, where
-`r` is the standard agent radius (~1.5).
+**A dropoff is not offset at all.** The offset exists so an agent does not clip
+a wall or snag on a corner. A cliff edge presents neither, and walking the lip
+of a ledge is legitimate. Standing off from every ledge as though it were
+masonry removed 12.4% of SmallMap's cells, and removed them from exactly the
+places worth keeping — balcony rims, platform edges, stair heads — where the
+ground is already narrowest.
+
+Boundary edges are classified from the surfel field alone, no Part consulted: a
+**wall** is a neighbouring column whose surface stands *above* us, a **dropoff**
+is one whose surface lies *below*, and open air is a dropoff too. The ambiguous
+case falls to wall, because over-eroding is safe and under-eroding is not.
+
+A run is wall or dropoff and never a blend — a mixed segment has no single
+correct push — so the greedy fit breaks on the class change and merging refuses
+to cross one. The classification is despeckled first: it is per cell and reads a
+neighbouring column, so it picks up grit, and each speck forces a break that
+merging can then never undo.
+
+Push each **wall** line inward along its normal by `clamp(maxD − margin, 0, r)`,
+where `r` is the standard agent radius (~1.5).
+
+`maxD` is the local **thickness of the ground behind the line**, and it must be
+measured by marching inward. Reading `D` at the boundary cells themselves is
+worthless: a boundary cell is 4-adjacent to a non-walkable cell by construction,
+so its `D` is always exactly 1, which pins the push at `clamp(1 − margin, 0, r)`
+forever and makes the grading below a constant.
 
 Grading matters. A hard "skip the offset if `maxD < r`" creates a discontinuity,
 so two adjacent polygons straddling the threshold get boundaries offset by 1.5
@@ -152,6 +205,28 @@ not optional — it is the only detector for that failure.
 Report it; never silently repair it. A severed layer is a tuning failure and has
 to be visible as one.
 
+Counting the pieces of what survives cannot see a layer that did not survive at
+all: annihilation is zero pieces, and `pieces > 1` is false for zero exactly as
+it is for one. That is the worst form of the failure and it was the one case
+that passed silently, so it is reported separately.
+
+### 10. Inter-layer links
+
+A layer is a 2.5D raster and a raster cannot express "upstairs". Step 1 is what
+makes each raster mean anything, but it also cuts the ramp free of the floor it
+climbs from, so the output is a pile of correct surfaces with no way between
+them.
+
+The cut is recoverable exactly, because the predicate that made it undoes it:
+two cells 4-adjacent in XZ and within `stepTol` are walkable neighbours, so if
+they landed in different layers that is a layer boundary drawn through
+traversable ground — a ramp foot, a stair head, a balcony meeting its walkway.
+A drop larger than `stepTol` is **not** a link, which is what keeps cliffs
+cliffs.
+
+Crossings are clustered by adjacency, so two staircases between the same pair of
+layers stay two links instead of one averaged point in the middle of neither.
+
 ## Why this survives real maps
 
 The only geometry contact in the entire chain is the raycast that built the
@@ -175,10 +250,22 @@ snapshot. Seconds per run, not 25 minutes.
 
 ## Known limits, stated rather than hidden
 
-- A layer that **spirals over itself** puts two heights in one cell key, and the
-  2D raster merges them. Connectivity keeps the layers apart correctly, but the
-  raster for that one layer is wrong. Does not arise on the current test scene;
-  will arise on a helix ramp.
+- Two heights in one cell key is now handled by the injectivity rule in step 1.
+  It was listed here as a spiral-ramp case that "does not arise on the current
+  test scene"; it arose, on 17.9% of SmallMap's largest layer.
+- **Polygon count is up, not down, since dropoff classification landed**:
+  324 → 491 segments on SmallMap, bevels 18 → 140. Breaking a run at every
+  wall/dropoff transition fragments the outline, and the bevels are the miter
+  limit correctly handling real notches where a wall line pushed 1.5 meets a
+  ledge line pushed 0. Honest geometry, but more of it than before.
+- **Small regions stay isolated**: 22 regions collapse to 17 islands via links.
+  The remainder are crates and small platforms that likely need *jump* links,
+  not walk links. Connectivity is never invented to improve that number.
+- The distance transform still measures thickness **across** a same-layer cliff,
+  so the offset there over-estimates available ground and pushes further than it
+  needs to. Over-pushing is erosion, which is safe, so it is left for now.
+- A staircase with **no ClipRamp over it** still fragments into micro-layers and
+  draws picket-fence rings. On SmallMap the stairs near (81, 105) have none.
 - The offset is measured against a **standard agent radius**. Ground narrower
   than that is preserved (graded offset, not a width floor), but the boundary it
   produces is an agent-radius-informed one, and a very different body may want a
