@@ -936,9 +936,118 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		end
 	end
 
+	----------------------------------------------------------------------
+	-- STEP 10 — inter-layer links
+	--
+	-- Layers are 2.5D rasters and a raster cannot express "upstairs". Splitting
+	-- by connectivity AND x:z injectivity is what makes each raster meaningful,
+	-- but it also cuts the ramp free of the floor it climbs from, so the output
+	-- is a pile of disconnected islands: correct surfaces, no way between them.
+	--
+	-- The cut is recoverable exactly, because it is the same predicate that made
+	-- it. Two cells 4-adjacent in XZ and within a step of each other are
+	-- walkable neighbours; if they landed in different layers, that is precisely
+	-- where a layer boundary was drawn through traversable ground -- a ramp foot,
+	-- a stair head, a balcony meeting its walkway. A drop bigger than stepTol is
+	-- NOT a link, which is why cliffs stay cliffs.
+	--
+	-- Crossings are clustered into runs so a pair of layers touching in two
+	-- places yields two links rather than one averaged nonsense in between.
+	----------------------------------------------------------------------
+	local atAll: {[string]: {number}} = {}
+	for i, nd in ipairs(nodes) do
+		local k = nd.ix .. ":" .. nd.iz
+		local b = atAll[k]
+		if not b then b = {}; atAll[k] = b end
+		b[#b + 1] = i
+	end
+
+	local D4L = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+	local crossings: {[string]: {any}} = {}
+	for i, nd in ipairs(nodes) do
+		for _, d in ipairs(D4L) do
+			local b = atAll[(nd.ix + d[1]) .. ":" .. (nd.iz + d[2])]
+			if b then
+				for _, ni in ipairs(b) do
+					local nb = nodes[ni]
+					-- one direction only, or every crossing is found twice
+					if nb.comp > nd.comp and math.abs(nb.y - nd.y) <= c.stepTol then
+						local pk = nd.comp .. ":" .. nb.comp
+						local list = crossings[pk]
+						if not list then list = {}; crossings[pk] = list end
+						list[#list + 1] = {
+							ix = nd.ix, iz = nd.iz,
+							from = Vector3.new(nd.ix + 0.5, nd.y, nd.iz + 0.5),
+							to = Vector3.new(nb.ix + 0.5, nb.y, nb.iz + 0.5),
+						}
+					end
+				end
+			end
+		end
+	end
+
+	local links: {any} = {}
+	for pk, list in pairs(crossings) do
+		local a, bId = pk:match("(%d+):(%d+)")
+		-- cluster by adjacency of the crossing cells, so two separate staircases
+		-- between the same pair of layers stay two links
+		local byCell: {[string]: {number}} = {}
+		for idx, cr in ipairs(list) do
+			local k = cr.ix .. ":" .. cr.iz
+			local bb = byCell[k]
+			if not bb then bb = {}; byCell[k] = bb end
+			bb[#bb + 1] = idx
+		end
+		local taken: {[number]: boolean} = {}
+		for idx = 1, #list do
+			if not taken[idx] then
+				local group = { idx }
+				taken[idx] = true
+				local queue, head = { idx }, 1
+				while head <= #queue do
+					local cur = list[queue[head]]; head += 1
+					for _, d in ipairs(D4L) do
+						local bb = byCell[(cur.ix + d[1]) .. ":" .. (cur.iz + d[2])]
+						if bb then
+							for _, j in ipairs(bb) do
+								if not taken[j] then
+									taken[j] = true
+									group[#group + 1] = j
+									queue[#queue + 1] = j
+								end
+							end
+						end
+					end
+				end
+				local fx, fy, fz, tx, ty, tz = 0, 0, 0, 0, 0, 0
+				for _, j in ipairs(group) do
+					local cr = list[j]
+					fx += cr.from.X; fy += cr.from.Y; fz += cr.from.Z
+					tx += cr.to.X;   ty += cr.to.Y;   tz += cr.to.Z
+				end
+				local n = #group
+				links[#links + 1] = {
+					a = tonumber(a), b = tonumber(bId),
+					cells = n,
+					-- how wide the opening is, in studs of shared frontage
+					width = n,
+					from = Vector3.new(fx / n, fy / n, fz / n),
+					to = Vector3.new(tx / n, ty / n, tz / n),
+				}
+			end
+		end
+	end
+	stats.links = #links
+	local linkedLayers: {[number]: boolean} = {}
+	for _, l in ipairs(links) do linkedLayers[l.a] = true; linkedLayers[l.b] = true end
+	local nLinked = 0
+	for _ in pairs(linkedLayers) do nLinked += 1 end
+	stats.linkedLayers = nLinked
+	stats.isolatedLayers = #comps - nLinked
+
 	if stats.offsetMin == math.huge then stats.offsetMin = 0 end
 	stats.seconds = os.clock() - t0
-	return { regions = regions, stats = stats, config = c }
+	return { regions = regions, stats = stats, config = c, links = links }
 end
 
 --------------------------------------------------------------------------
@@ -977,6 +1086,22 @@ function Boundary.visualize(res: any, parent: Instance?)
 			for i = 1, #hv do
 				bar(hv[i], hv[(i % #hv) + 1], Color3.fromRGB(80, 200, 255), 0.18, sub)
 			end
+		end
+	end
+
+	-- Links, in green: where one layer hands over to another. If a staircase
+	-- has no green bar at its foot or its head, the bake has produced two
+	-- surfaces with no way between them, and that is visible at a glance.
+	if res.links and #res.links > 0 then
+		local lf = Instance.new("Folder")
+		lf.Name = "Links"
+		lf.Parent = folder
+		for _, l in ipairs(res.links) do
+			local seg = Instance.new("Folder")
+			seg.Name = string.format("L%d_%d_w%d", l.a, l.b, l.width)
+			seg.Parent = lf
+			bar(l.from + Vector3.new(0, 0.5, 0), l.to + Vector3.new(0, 0.5, 0),
+				Color3.fromRGB(90, 255, 120), 0.45, seg)
 		end
 	end
 	return folder
