@@ -41,10 +41,18 @@ export type Config = {
 	-- (a mesh with a ledge), so its trace still needs to know what counts as a
 	-- cliff. Block grids are a single plane and never consult this.
 	stepTol: number?,
+
+	-- How far, in cells, a boundary edge may sit from a killer's face plane and
+	-- still be considered part of it. A staircased run is quantized by at most
+	-- one cell, so slightly over one is the honest window: wide enough to catch
+	-- every step of the staircase, too narrow to reach a plane that is not the
+	-- one that made this edge.
+	snapCells: number?,
 }
 
 local DEFAULT = {
 	stepTol = 2.2,
+	snapCells = 1.1,
 }
 
 local function merged(cfg): any
@@ -76,15 +84,21 @@ local function corners(u: number, v: number, di: number)
 	else return { u, v }, { u + 1, v } end
 end
 
-local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any) -> boolean)?)
+local function traceMask(cells: {any}, index: {[string]: any}, deadIndex: {[string]: any}?, cliff: ((any, any) -> boolean)?)
 	local segs: {any} = {}
 	local byStart: {[string]: {any}} = {}
 	for _, cell in ipairs(cells) do
 		for di, d in ipairs(DIRS) do
-			local nb = index[(cell.ui + d[1]) .. ":" .. (cell.vi + d[2])]
+			local nkey = (cell.ui + d[1]) .. ":" .. (cell.vi + d[2])
+			local nb = index[nkey]
 			if not nb or (cliff and cliff(cell, nb)) then
 				local a, b = corners(cell.ui, cell.vi, di)
-				local s = { a = a, b = b, cell = cell }
+				-- WHAT IS ON THE OTHER SIDE OF THIS EDGE, by name. A dead cell was
+				-- recorded with the instance that killed it, so the boundary never
+				-- has to re-probe the world to ask why the floor stops here -- which
+				-- is the whole reason LocalGrid keeps the attribution.
+				local dead = deadIndex and deadIndex[nkey]
+				local s = { a = a, b = b, cell = cell, killer = dead and dead.killer or nil }
 				segs[#segs + 1] = s
 				local k = a[1] .. "," .. a[2]
 				local bucket = byStart[k]
@@ -140,33 +154,67 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 	return loops
 end
 
--- The ordered lattice corners of a loop, with the duplicate a corner cell
--- contributes collapsed, and with runs along one lattice line reduced to their
--- endpoints. On a local grid a straight rim is exactly one lattice line, so
--- this is not a fit and has no tolerance -- it is just not repeating a point.
-local function loopCorners(loop: {any}): {{number}}
-	local pts: {{number}} = {}
-	for _, s in ipairs(loop) do
-		local last = pts[#pts]
-		if not last or last[1] ~= s.a[1] or last[2] ~= s.a[2] then
-			pts[#pts + 1] = { s.a[1], s.a[2] }
+--------------------------------------------------------------------------
+-- SNAPPING A RUN TO THE THING THAT CAUSED IT
+--
+-- The outer rim of a grid is exact because it is the host part's own face. A
+-- HOLE is not: it is the footprint of some other part standing on the host, and
+-- if that part disagrees with the host's orientation its footprint staircases
+-- across the host's lattice exactly the way everything used to staircase across
+-- the world's. Measured on SmallMap's ground slab: the two buildings sharing
+-- the ground's 8 degree yaw gave holes with 120-stud straight edges, while the
+-- two that did not gave holes of 130 and 152 vertices whose longest edge was 2
+-- studs and 1 stud. Same map, same code -- the difference is only whether two
+-- parts happened to agree.
+--
+-- Fitting a line to that staircase is what the old world-raster module did, and
+-- it is still the wrong answer: the true line is not unknown. `LocalGrid` killed
+-- each of those cells and wrote down WHICH INSTANCE killed it. So take that
+-- part's side faces, intersect them with the host's face plane, and put the
+-- boundary on the resulting line exactly. No fit, no tolerance on the geometry,
+-- and the answer is right at any angle because it never involved the lattice.
+--
+-- A killer's side face, as a line in the host's own 2D face coordinates. A point
+-- (a, b) means the world point origin + u*a + v*b, so a face plane through Q
+-- with normal m is  a*(u.m) + b*(v.m) = (Q-P0).m  -- an ordinary 2D line.
+--------------------------------------------------------------------------
+
+local function sideLines(part: BasePart, origin: Vector3, u: Vector3, v: Vector3): {any}
+	local cf, sz = part.CFrame, part.Size
+	local axes = {
+		{ dir = cf.RightVector, ext = sz.X * 0.5 },
+		{ dir = cf.UpVector, ext = sz.Y * 0.5 },
+		{ dir = cf.RightVector:Cross(cf.UpVector), ext = sz.Z * 0.5 },
+	}
+	local out = {}
+	for _, ax in ipairs(axes) do
+		for _, sgn in ipairs({ 1, -1 }) do
+			local m = ax.dir * sgn
+			local A, B = u:Dot(m), v:Dot(m)
+			-- A face parallel to the host's own plane cuts it in nothing. That is
+			-- the killer's top and bottom, and skipping them is what leaves the
+			-- four side faces that actually form the wall.
+			local mag = math.sqrt(A * A + B * B)
+			if mag > 1e-4 then
+				local Q = part.Position + m * ax.ext
+				out[#out + 1] = { A = A / mag, B = B / mag, C = (Q - origin):Dot(m) / mag }
+			end
 		end
 	end
-	if #pts > 1 and pts[1][1] == pts[#pts][1] and pts[1][2] == pts[#pts][2] then
-		pts[#pts] = nil
-	end
-	if #pts < 3 then return {} end
-	local out: {{number}} = {}
-	for i = 1, #pts do
-		local p = pts[i]
-		local a = pts[(i - 2) % #pts + 1]
-		local b = pts[i % #pts + 1]
-		-- keep p only where the direction changes
-		local d1u, d1v = p[1] - a[1], p[2] - a[2]
-		local d2u, d2v = b[1] - p[1], b[2] - p[2]
-		if d1u * d2v - d1v * d2u ~= 0 then out[#out + 1] = p end
-	end
-	return #out >= 3 and out or pts
+	return out
+end
+
+local function lineDist(L: any, a: number, b: number): number
+	return math.abs(L.A * a + L.B * b - L.C)
+end
+
+-- Where two of those lines cross. Near-parallel has no usable crossing, and
+-- forcing one produces the miter spike that plagued the old module, so it is
+-- reported rather than invented.
+local function intersect(L1: any, L2: any): (number?, number?)
+	local det = L1.A * L2.B - L2.A * L1.B
+	if math.abs(det) < 1e-6 then return nil, nil end
+	return (L1.C * L2.B - L2.C * L1.B) / det, (L1.A * L2.C - L2.A * L1.C) / det
 end
 
 local function signedArea(pts: {Vector3}): number
@@ -182,38 +230,43 @@ end
 -- One grid -> its rings, in world space
 --------------------------------------------------------------------------
 
-local function ringsOfGrid(g: any, c: any)
+local function ringsOfGrid(g: any, c: any, stats: any)
 	local isBlock = not g.fallback and g.n ~= nil
 	local step = g.step
 
+	-- Lattice index -> host face coordinate, RIM-EXACT at the extremes. The
+	-- lattice covers nu whole cells of `step`, which is up to one step short of
+	-- the face's real half-extent, so the outermost lattice line is mapped to the
+	-- part's own extent instead. This is what LocalGrid keeps center/uExt/vExt
+	-- for, and it is the same idea the killer snapping below generalises.
+	local nu = isBlock and math.max(1, math.floor(2 * g.uExt / step + 1e-6)) or 0
+	local nv = isBlock and math.max(1, math.floor(2 * g.vExt / step + 1e-6)) or 0
+	local function toFace(iu: number, iv: number): (number, number)
+		local uc = (iu <= 0) and 0 or (iu >= nu and 2 * g.uExt or iu * step)
+		local vc = (iv <= 0) and 0 or (iv >= nv and 2 * g.vExt or iv * step)
+		return uc, vc
+	end
+
 	local toWorld
 	if isBlock then
-		-- Index -> local face coordinate, RIM-EXACT at the extremes. The lattice
-		-- covers nu whole cells of `step`, which is up to one step short of the
-		-- face's real half-extent, so the outermost lattice line is mapped to the
-		-- part's own extent instead of to the lattice. This is the whole reason
-		-- LocalGrid keeps center/uExt/vExt.
-		local nu = math.max(1, math.floor(2 * g.uExt / step + 1e-6))
-		local nv = math.max(1, math.floor(2 * g.vExt / step + 1e-6))
-		toWorld = function(iu: number, iv: number): Vector3
-			local uc = (iu <= 0) and 0 or (iu >= nu and 2 * g.uExt or iu * step)
-			local vc = (iv <= 0) and 0 or (iv >= nv and 2 * g.vExt or iv * step)
-			return g.origin + g.u * uc + g.v * vc
+		toWorld = function(a: number, b: number): Vector3
+			return g.origin + g.u * a + g.v * b
 		end
 	else
-		-- Fallback grid: ui/vi are world XZ lattice indices, and the surface is
-		-- not one plane, so a corner takes the height of the nearest cell that
-		-- owns it. No search and no fit -- the four cells touching a lattice
-		-- corner are the only candidates there are.
-		toWorld = function(iu: number, iv: number): Vector3
-			local best, bestY = nil, 0
+		-- Fallback grid: ui/vi are world XZ lattice indices and the surface is not
+		-- one plane, so a corner takes the height of the highest cell touching it.
+		-- No search and no fit: the four cells at a lattice corner are the only
+		-- candidates there are.
+		toWorld = function(a: number, b: number): Vector3
+			local iu, iv = math.floor(a / step + 0.5), math.floor(b / step + 0.5)
+			local bestY = nil
 			for du = -1, 0 do
 				for dv = -1, 0 do
 					local cell = g.index[(iu + du) .. ":" .. (iv + dv)]
-					if cell and (not best or cell.pos.Y > bestY) then best, bestY = cell, cell.pos.Y end
+					if cell and (not bestY or cell.pos.Y > bestY) then bestY = cell.pos.Y end
 				end
 			end
-			return Vector3.new(iu * step, best and best.pos.Y or 0, iv * step)
+			return Vector3.new(a, bestY or 0, b)
 		end
 	end
 
@@ -224,14 +277,121 @@ local function ringsOfGrid(g: any, c: any)
 		end
 	end
 
+	-- A killer's side lines, computed once per killer per grid.
+	local linesOf: {[Instance]: any} = {}
+	local function killerLines(k: Instance?)
+		if not k or not isBlock then return nil end
+		local cached = linesOf[k]
+		if cached ~= nil then return cached ~= false and cached or nil end
+		-- Only a Block has faces worth stealing. A Union or a MeshPart has a
+		-- bounding box that is not its shape, and snapping a boundary onto a box
+		-- that the geometry does not fill would hand back ground that is not
+		-- there. Those keep the lattice outline, which is conservative.
+		local ok = k:IsA("Part") and (k :: any).Shape == Enum.PartType.Block
+		local lines = ok and sideLines(k :: BasePart, g.origin, g.u, g.v) or false
+		linesOf[k] = lines
+		return lines ~= false and lines or nil
+	end
+
+	local snapMax = c.snapCells * step
+
 	local rings: {any} = {}
-	for _, loop in ipairs(traceMask(g.cells, g.index, cliff)) do
-		local lat = loopCorners(loop)
-		if #lat >= 3 then
-			local verts = table.create(#lat)
-			for i, p in ipairs(lat) do verts[i] = toWorld(p[1], p[2]) end
-			rings[#rings + 1] = { verts = verts, area = signedArea(verts) }
+	for _, loop in ipairs(traceMask(g.cells, g.index, g.deadIndex, cliff)) do
+		-- every boundary edge in face coordinates, with the line it belongs to
+		local edges = {}
+		for _, s in ipairs(loop) do
+			local a1, a2 = toFace(s.a[1], s.a[2])
+			local b1, b2 = toFace(s.b[1], s.b[2])
+			local line = nil
+			local cand = killerLines(s.killer)
+			if cand then
+				-- Only ever the lines of THIS edge's own killer, so a boundary can
+				-- never be pulled onto a plane belonging to some unrelated part that
+				-- happens to pass nearby. The edge midpoint is the test: on a
+				-- staircased run half the edges lie along the true line and half run
+				-- across it, and requiring parallelism would throw away the second
+				-- half. Both kinds sit within half a cell of the line.
+				local mu, mv = (a1 + b1) * 0.5, (a2 + b2) * 0.5
+				local best = math.huge
+				for _, L in ipairs(cand) do
+					local d = lineDist(L, mu, mv)
+					if d < best and d <= snapMax then best, line = d, L end
+				end
+			end
+			edges[#edges + 1] = { a = { a1, a2 }, b = { b1, b2 }, line = line }
 		end
+		if #edges < 4 then continue end
+
+		-- Group consecutive edges sharing a line into runs. Rotate first so a run
+		-- never straddles the arbitrary start of the loop.
+		local n = #edges
+		local start = 1
+		for i = 1, n do
+			if edges[i].line ~= edges[(i - 2) % n + 1].line then start = i; break end
+		end
+		local runs = {}
+		for k = 0, n - 1 do
+			local e = edges[(start - 1 + k) % n + 1]
+			local last = runs[#runs]
+			if last and last.line and last.line == e.line then
+				last.edges[#last.edges + 1] = e
+			else
+				runs[#runs + 1] = { line = e.line, edges = { e } }
+			end
+		end
+
+		-- Corners are where two runs meet: two snapped lines cross exactly, and
+		-- anything else keeps the lattice corner it already had. A run on a line
+		-- contributes only that corner; a run that was not snapped also
+		-- contributes its own interior points.
+		local face = {}
+		for i, run in ipairs(runs) do
+			local prev = runs[(i - 2) % #runs + 1]
+			local shared = run.edges[1].a
+			local pu, pv = shared[1], shared[2]
+			if run.line and prev.line and run.line ~= prev.line then
+				local ix, iy = intersect(prev.line, run.line)
+				if ix and math.abs(ix - pu) <= snapMax * 4 and math.abs(iy - pv) <= snapMax * 4 then
+					pu, pv = ix, iy
+					stats.corners += 1
+				else
+					stats.unstableCorners += 1
+				end
+			elseif run.line then
+				-- entering a snapped run from an unsnapped one: slide the lattice
+				-- corner onto the line rather than leaving a step at the join
+				local d = run.line.A * pu + run.line.B * pv - run.line.C
+				pu, pv = pu - run.line.A * d, pv - run.line.B * d
+			elseif prev.line then
+				local d = prev.line.A * pu + prev.line.B * pv - prev.line.C
+				pu, pv = pu - prev.line.A * d, pv - prev.line.B * d
+			end
+			face[#face + 1] = { pu, pv }
+			if not run.line then
+				for k = 2, #run.edges do
+					local p = run.edges[k].a
+					face[#face + 1] = { p[1], p[2] }
+				end
+			end
+		end
+
+		-- drop points that carry no turn (a straight lattice run, or two runs that
+		-- resolved onto the same line)
+		local kept = {}
+		for i = 1, #face do
+			local p = face[i]
+			local a = face[(i - 2) % #face + 1]
+			local b = face[i % #face + 1]
+			local d1u, d1v = p[1] - a[1], p[2] - a[2]
+			local d2u, d2v = b[1] - p[1], b[2] - p[2]
+			if math.abs(d1u * d2v - d1v * d2u) > 1e-6 then kept[#kept + 1] = p end
+		end
+		if #kept < 3 then kept = face end
+		if #kept < 3 then continue end
+
+		local verts = table.create(#kept)
+		for i, p in ipairs(kept) do verts[i] = toWorld(p[1], p[2]) end
+		rings[#rings + 1] = { verts = verts, area = signedArea(verts) }
 	end
 	return rings
 end
@@ -249,12 +409,15 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 	local stats = {
 		parts = 0, block = 0, fallback = 0,
 		regions = 0, holes = 0, verts = 0, emptyGrids = 0,
+		-- corners recovered by crossing two real face planes, and the ones where
+		-- the planes were too near parallel to cross usefully
+		corners = 0, unstableCorners = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
 		stats.parts += 1
 		if g.fallback then stats.fallback += 1 else stats.block += 1 end
-		local rings = ringsOfGrid(g, c)
+		local rings = ringsOfGrid(g, c, stats)
 		if #rings == 0 then
 			stats.emptyGrids += 1
 			continue
