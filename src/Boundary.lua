@@ -259,7 +259,7 @@ end
 -- against real geometry instead.
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any, cls: {string})
+local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any)
 	local n = #pts
 	local segs: {any} = {}
 	if n < 2 then return segs end
@@ -279,8 +279,34 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string})
 	-- is the one thing that invents connectivity. So a foreign stretch longer
 	-- than `maxGap` ends the run: a speck is ignored, a real stretch is a
 	-- boundary of its own.
+	-- A RUN OF ONE NODE HAS NO DIRECTION OF ITS OWN.
+	--
+	-- fitLine returns an arbitrary axis when the covariance is degenerate, which
+	-- is exactly what one node gives it. The neighbouring line is then crossed
+	-- against a line pointing nowhere in particular and the corner lands wherever
+	-- that happens to meet.
+	--
+	-- It is not a rare shape. Every ClipRamp on this map has a single-node seam
+	-- run at EACH end of its bottom edge -- the bottom edge itself is one clean
+	-- 25-node run fitting to 0.00 -- so both corners where the ramp foot meets
+	-- the ground were being placed by an arbitrary line.
+	--
+	-- Deleting the run was tried and cost far more than it gained. The node is
+	-- real; only the direction is missing, and the ring already knows it: take
+	-- the travel from the node before to the node after.
 	local function fitAndPush(idx: {number}, T: string)
 		if #idx < 1 then return end
+		if #idx == 1 then
+			local i = idx[1]
+			local d = sub(pts[i % n + 1], pts[(i - 2) % n + 1])
+			local m = len(d)
+			stats.singletonRuns += 1
+			segs[#segs + 1] = {
+				idx = idx, cen = pts[i], class = T,
+				dir = (m > 1e-9) and { x = d.x / m, z = d.z / m } or { x = 1, z = 0 },
+			}
+			return
+		end
 		local cen, dir = fitLine(pts, idx)
 		segs[#segs + 1] = { idx = idx, cen = cen, dir = dir, class = T }
 	end
@@ -680,7 +706,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- silently dropping them is the one operation in this module that can
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
-		local rawSegs = segmentLoop(pts, c, cls)
+		local rawSegs = segmentLoop(pts, c, cls, stats)
 		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
 		if c.debugPart and g.part == c.debugPart then
@@ -935,7 +961,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0,
+		wallsInset = 0, singletonRuns = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
