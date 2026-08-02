@@ -254,7 +254,7 @@ end
 -- against real geometry instead.
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any, cls: {string})
+local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any)
 	local n = #pts
 	local segs: {any} = {}
 	if n < 2 then return segs end
@@ -274,8 +274,22 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string})
 	-- is the one thing that invents connectivity. So a foreign stretch longer
 	-- than `maxGap` ends the run: a speck is ignored, a real stretch is a
 	-- boundary of its own.
+	-- A RUN OF ONE NODE HAS NO DIRECTION.
+	--
+	-- fitLine falls back to an arbitrary axis when the covariance is degenerate,
+	-- which is exactly what a single node gives it. The neighbouring line is then
+	-- intersected against a line pointing nowhere in particular, and the corner
+	-- lands wherever that happens to cross -- on the big Union's crescent, 30
+	-- studs out across open ground. One stray node, one 32-stud edge.
+	--
+	-- A single node cannot be fitted, so it is not fitted. Its neighbours meet
+	-- each other instead.
 	local function fitAndPush(idx: {number}, T: string)
 		if #idx < 1 then return end
+		if #idx < 2 then
+			stats.singletonRuns += 1
+			return
+		end
 		local cen, dir = fitLine(pts, idx)
 		segs[#segs + 1] = { idx = idx, cen = cen, dir = dir, class = T }
 	end
@@ -344,6 +358,24 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string})
 		end
 	end
 	fitAndPush(cur, T)
+
+	-- NOTHING MAY BE LEFT OFF THE END. A stretch of foreign-class nodes running
+	-- to the end of the ring is never closed by the gap test -- it simply stops --
+	-- so those nodes belonged to no run at all and the polygon jumped over them.
+	-- On the Union's ring, 4 of 104 nodes.
+	local covered = 0
+	for _, sg in ipairs(segs) do
+		if sg.idx[#sg.idx] > covered then covered = sg.idx[#sg.idx] end
+	end
+	if covered < n then
+		local tail = {}
+		local tailT = cls[covered + 1]
+		for k = covered + 1, n do
+			if cls[k] == tailT then tail[#tail + 1] = k end
+		end
+		stats.tailNodes += n - covered
+		fitAndPush(tail, tailT)
+	end
 	return segs
 end
 
@@ -602,7 +634,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- silently dropping them is the one operation in this module that can
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
-		local segs = mergeSegments(pts, segmentLoop(pts, c, cls), c)
+		local segs = mergeSegments(pts, segmentLoop(pts, c, cls, stats), c)
 		stats.rawSegments += #segs
 		if #segs < 3 then
 			local box = boxIfExact(pts, step)
@@ -830,6 +862,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		cornersOffMask = 0, cornersClamped = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0, cornersTrimmed = 0,
+		singletonRuns = 0, tailNodes = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
