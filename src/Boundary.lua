@@ -68,6 +68,7 @@ local DEFAULT = {
 	collinearDeg = 5,
 	miterLimit = 3.0,
 	maxGap = 3.0,
+	mergeNeedsFit = true,
 }
 
 local function merged(cfg): any
@@ -425,7 +426,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 		-- the combined residual is inside fitTol. The alternative is keeping a
 		-- stub that no downstream stage can use: its line is near parallel to its
 		-- neighbour's, so the corner between them is unstable by construction.
-		if not force and maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
+		if (not force or c.mergeNeedsFit) and maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
 		return { idx = idx, cen = cen, dir = dir, class = a.class }
 	end
 
@@ -642,6 +643,12 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		for _, sg in ipairs(segs) do
 			local nrm = outwardOf(sg.dir)
 			local cval = dot(sg.cen, nrm)
+			-- WORST DISTANCE FROM A LINE TO A NODE IT CLAIMS. fitTol is the
+			-- promise; anything far above it means a line is being drawn through
+			-- nodes it does not follow.
+			local res = maxResidual(pts, sg.idx, sg.cen, sg.dir)
+			if res > stats.worstFit then stats.worstFit = res end
+			if res > c.fitTol * 1.5 then stats.linesOffNodes += 1 end
 			-- Balance is structural, not hoped for: the fit runs through the
 			-- centroid, so the signed offsets of its own nodes sum to zero. Kept
 			-- as a measured invariant because the previous version's outward
@@ -791,7 +798,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
-		worstLean = 0,
+		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
