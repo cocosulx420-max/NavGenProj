@@ -267,7 +267,19 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 			for bit, d in ipairs(DIR8) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
-				local floor, above = false, false
+				-- BELOW OUTRANKS ABOVE, and getting that backwards is what marked
+				-- the rim of every raised platform as a wall. "Any surface higher
+				-- than stepTol is a wall" cannot tell a riser you would bump into
+				-- from a balcony three storeys up: measured, the surface found
+				-- above those rim nodes was 9, 13, even 18 studs overhead, with
+				-- open air the whole way down.
+				--
+				-- Live floor BELOW is the giveaway. If floor is visible down there
+				-- the space is open and you would fall through it -- a dropoff, no
+				-- matter what is overhead. A wall standing at that spot would have
+				-- killed that floor, so it would not be live. So: floor first,
+				-- then below, then above.
+				local floor, above, below = false, false, false
 				for ox = -1, 1 do
 					for oz = -1, 1 do
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
@@ -279,14 +291,17 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 									floor = true
 								elseif dy > c.stepTol then
 									above = true
+								else
+									below = true
 								end
 							end
 						end
 					end
 				end
+				if below then above = false end
 				if not floor then
 					-- a cell killed by something overhead is that something's wall
-					if not above then
+					if not above and not below then
 						for ox = -1, 1 do
 							for oz = -1, 1 do
 								for _, e in ipairs(dead[(bx + ox) .. ":" .. (bz + oz)] or {}) do
