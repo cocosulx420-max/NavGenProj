@@ -169,10 +169,11 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 	local byStart: {[string]: {any}} = {}
 	for _, cell in ipairs(cells) do
 		for di, d in ipairs(DIRS) do
-			local nb = index[(cell.ui + d[1]) .. ":" .. (cell.vi + d[2])]
+			local nu, nv = cell.ui + d[1], cell.vi + d[2]
+			local nb = index[nu .. ":" .. nv]
 			if not nb or (cliff and cliff(cell, nb)) then
 				local a, b = cornersOf(cell.ui, cell.vi, di)
-				local s = { a = a, b = b, cell = cell }
+				local s = { a = a, b = b, cell = cell, nu = nu, nv = nv, dir = d }
 				segs[#segs + 1] = s
 				local k = a[1] .. "," .. a[2]
 				local bucket = byStart[k]
@@ -244,11 +245,22 @@ end
 -- against real geometry instead.
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any)
+local function segmentLoop(pts: {P2}, c: any, cls: {string})
 	local n = #pts
 	local segs: {any} = {}
 	local cur = { 1 }
 	for i = 2, n do
+		-- A RUN IS ONE CLASS OR IT IS ANOTHER, NEVER A BLEND. DESIGN.md requires
+		-- this because the classes are offset by different amounts: a segment
+		-- spanning a wall and a ledge has no single correct push and would have
+		-- to compromise into either a wall that is not stood off from or a ledge
+		-- that is eroded. Break the run and fit the two halves separately.
+		if cls[i] ~= cls[cur[1]] then
+			local ce0, de0 = fitLine(pts, cur)
+			segs[#segs + 1] = { idx = cur, cen = ce0, dir = de0, class = cls[cur[1]] }
+			cur = { i }
+			continue
+		end
 		-- REVERSAL ENDS A RUN, and the residual test cannot see it.
 		--
 		-- DESIGN.md makes this point about step 8 -- "an abs test calls a
@@ -277,14 +289,14 @@ local function segmentLoop(pts: {P2}, c: any)
 			-- Close the run and start the next one AT this point, so the two
 			-- segments share it.
 			local ce, de = fitLine(pts, cur)
-			segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+			segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
 			cur = { i - 1, i }
 		else
 			cur = trial
 		end
 	end
 	local ce, de = fitLine(pts, cur)
-	segs[#segs + 1] = { idx = cur, cen = ce, dir = de }
+	segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
 	return segs
 end
 
@@ -342,6 +354,9 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	local cosLim = math.cos(math.rad(c.collinearDeg))
 
 	local function refit(a: any, b: any): any?
+		-- never across a class change: the merged run would need one push for
+		-- what is wall and another for what is ledge
+		if a.class ~= b.class then return nil end
 		-- never across a reversal, for the same reason step 4 breaks on one: the
 		-- two sides of a thin strip are within fitTol of each other, so the
 		-- residual test alone would happily weld them into one segment
@@ -354,7 +369,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 		end
 		local cen, dir = fitLine(pts, idx)
 		if maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
-		return { idx = idx, cen = cen, dir = dir }
+		return { idx = idx, cen = cen, dir = dir, class = a.class }
 	end
 
 	-- SEAM. The walk's start point on a closed loop is arbitrary, so a straight
@@ -419,7 +434,65 @@ end
 -- One grid -> its rings, in world space
 --------------------------------------------------------------------------
 
-local function ringsOfGrid(g: any, c: any, stats: any)
+--------------------------------------------------------------------------
+-- CLASSIFY A BOUNDARY EDGE — wall, dropoff, or seam
+--
+-- DESIGN.md offsets WALLS ONLY: an agent must not clip masonry, but walking the
+-- lip of a ledge is legitimate, and standing off from every ledge removed 12.4%
+-- of SmallMap's cells from exactly the places worth keeping.
+--
+-- Per-part grids add a third class the world raster never had. Two slabs laid
+-- side by side at the same height are continuous floor, but each grid stops at
+-- its own rim, so BOTH emit a boundary along the join. Measured on SmallMap,
+-- 41% of every boundary edge in the bake is one of these -- not a boundary at
+-- all. Offsetting them would carve a wall down the middle of a flat floor, and
+-- they are where one polygon hands over to the next.
+--
+-- Nothing here consults a Part. A seam is "another grid has a walkable cell
+-- there, within a step of our height", a wall is "the cell there was killed
+-- from above, or another grid's floor stands above us", and a dropoff is the
+-- rest. All three are answered out of cells.
+--------------------------------------------------------------------------
+
+local SEAM, WALL, DROP = "seam", "wall", "drop"
+
+local function classifierFor(localData: any, c: any)
+	local world: {[string]: {any}} = {}
+	for part, g in pairs(localData.grids) do
+		for _, cell in ipairs(g.cells) do
+			local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+			local b = world[k]
+			if not b then b = {}; world[k] = b end
+			b[#b + 1] = { y = cell.pos.Y, part = part }
+		end
+	end
+	return function(g: any, s: any): string
+		local step = g.step
+		local d = s.dir
+		local wp
+		if not g.fallback and g.n then
+			wp = s.cell.pos + g.u * (d[1] * step) + g.v * (d[2] * step)
+		else
+			wp = s.cell.pos + Vector3.new(d[1] * step, 0, d[2] * step)
+		end
+		local bucket = world[math.floor(wp.X) .. ":" .. math.floor(wp.Z)]
+		if bucket then
+			for _, e in ipairs(bucket) do
+				if e.part ~= g.part then
+					local dy = e.y - s.cell.pos.Y
+					if math.abs(dy) <= c.stepTol then return SEAM end
+					-- another surface standing above us is masonry, same as a
+					-- neighbouring column would be
+					if dy > c.stepTol then return WALL end
+				end
+			end
+		end
+		if g.deadIndex[s.nu .. ":" .. s.nv] then return WALL end
+		return DROP
+	end
+end
+
+local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 	local isBlock = not g.fallback and g.n ~= nil
 	local step = g.step
 
@@ -463,12 +536,20 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- Ordered boundary cell CENTRES. A corner cell contributes two edges and
 		-- the duplicate carries no information, so collapse it.
 		local pts: {P2} = {}
-		local lastCell = nil
+		local cls: {string} = {}
+		local lastCell, lastCls = nil, nil
 		for _, s in ipairs(loop) do
-			if s.cell ~= lastCell then
+			local k = classify(g, s)
+			-- Collapse the duplicate a corner cell contributes, but ONLY while the
+			-- class holds: a cell with a wall on one side and a seam on the other
+			-- has to appear twice or one of the two runs loses its start point.
+			if s.cell ~= lastCell or k ~= lastCls then
 				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
-				lastCell = s.cell
+				cls[#cls + 1] = k
+				lastCell, lastCls = s.cell, k
 			end
+			stats.edges += 1
+			stats[k] += 1
 		end
 		if #pts < 3 then continue end
 
@@ -483,7 +564,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- silently dropping them is the one operation in this module that can
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
-		local segs = mergeSegments(pts, segmentLoop(pts, c), c)
+		local segs = mergeSegments(pts, segmentLoop(pts, c, cls), c)
 		stats.rawSegments += #segs
 		if #segs < 3 then
 			local box = boxIfExact(pts, step)
@@ -513,16 +594,19 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				local d = dot(pts[i], nrm)
 				if d > cval then cval = d end
 			end
-			lines[#lines + 1] = { n = nrm, c = cval, anchor = pts[sg.idx[#sg.idx]] }
+			lines[#lines + 1] = { n = nrm, c = cval, anchor = pts[sg.idx[#sg.idx]], class = sg.class }
 		end
 
 		----------------------------------------------------------------
 		-- STEP 7 — corners are the intersections of adjacent lines
 		----------------------------------------------------------------
 		local verts: {P2} = {}
+		local vcls: {string} = {}
 		local nL = #lines
 		for i = 1, nL do
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
+			-- the edge LEAVING this corner runs along l2, so it carries l2's class
+			local leaving = l2.class
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
 			local anchor = l1.anchor
 			if math.abs(det) < 1e-6 then
@@ -530,6 +614,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				stats.unstableCorners += 1
 				local s = l1.c - dot(anchor, l1.n)
 				verts[#verts + 1] = { x = anchor.x + l1.n.x * s, z = anchor.z + l1.n.z * s }
+				vcls[#vcls + 1] = leaving
 			else
 				local px = (l1.c * l2.n.z - l2.c * l1.n.z) / det
 				local pz = (l1.n.x * l2.c - l2.n.x * l1.c) / det
@@ -539,10 +624,13 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					stats.bevels += 1
 					local s1 = l1.c - dot(anchor, l1.n)
 					verts[#verts + 1] = { x = anchor.x + l1.n.x * s1, z = anchor.z + l1.n.z * s1 }
+					vcls[#vcls + 1] = leaving
 					local s2 = l2.c - dot(anchor, l2.n)
 					verts[#verts + 1] = { x = anchor.x + l2.n.x * s2, z = anchor.z + l2.n.z * s2 }
+					vcls[#vcls + 1] = leaving
 				else
 					verts[#verts + 1] = { x = px, z = pz }
+					vcls[#vcls + 1] = leaving
 				end
 			end
 		end
@@ -557,7 +645,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			end
 			continue
 		end
-		rings[#rings + 1] = { pts2 = verts, area = signed2(verts) }
+		rings[#rings + 1] = { pts2 = verts, cls = vcls, area = signed2(verts) }
 	end
 
 	-- Outer is the largest by magnitude. Magnitude, never the sign: this project
@@ -590,6 +678,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local world = table.create(#r.pts2)
 		for i, p in ipairs(r.pts2) do world[i] = toWorld(p) end
 		r.verts = world
+
 		r.outer = (r == outer)
 		stats.segments += #world
 	end
@@ -603,6 +692,7 @@ end
 function Boundary.fromLocal(localData: any, cfg: Config?)
 	local c = merged(cfg)
 	local t0 = os.clock()
+	local classify = classifierFor(localData, c)
 
 	local regions: {any} = {}
 	local stats = {
@@ -611,12 +701,14 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
 		-- rings the fit could not resolve, kept as their raw lattice outline
 		rawRings = 0, boxRings = 0,
+		-- boundary edges by class; seam edges are joins, not boundaries
+		edges = 0, seam = 0, wall = 0, drop = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
 		stats.parts += 1
 		if g.fallback then stats.fallback += 1 else stats.block += 1 end
-		local rings = ringsOfGrid(g, c, stats)
+		local rings = ringsOfGrid(g, c, stats, classify)
 		if #rings == 0 then
 			stats.emptyGrids += 1
 			continue
@@ -629,6 +721,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 			part = part,
 			fallback = g.fallback,
 			verts = outer.verts,
+			cls = outer.cls,
 			area = math.abs(outer.area),
 			cells = #g.cells,
 			dead = #g.dead,
@@ -636,7 +729,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		}
 		for _, r in ipairs(rings) do
 			if r ~= outer then
-				region.holes[#region.holes + 1] = { verts = r.verts, area = math.abs(r.area) }
+				region.holes[#region.holes + 1] = { verts = r.verts, cls = r.cls, area = math.abs(r.area) }
 			end
 		end
 		stats.verts += #region.verts
@@ -672,25 +765,30 @@ function Boundary.visualize(res: any, parent: Instance?)
 		p.Parent = into
 	end
 
-	-- Outer rings red, holes cyan, and a FALLBACK part's outline in amber --
-	-- those are the world-aligned ones, where the fit is doing the heavy
-	-- reconstruction, so they should be identifiable without counting anything.
+	-- COLOURED BY CLASS, because the class is the thing worth looking at: it
+	-- decides what gets offset and what becomes a join. Red is wall, blue is
+	-- dropoff, green is seam -- and a green run means two polygons meet there,
+	-- so a green ring around a flat floor is not a boundary at all. Grey is a
+	-- ring that fell back to its raw outline, where no class was resolved.
+	local COL = {
+		wall = Color3.fromRGB(255, 80, 80),
+		drop = Color3.fromRGB(80, 170, 255),
+		seam = Color3.fromRGB(90, 255, 120),
+	}
+	local GREY = Color3.fromRGB(150, 150, 150)
 	for ri, r in ipairs(res.regions) do
 		local sub = Instance.new("Folder")
 		sub.Name = string.format("R%d_%s_c%d_h%d%s", ri, r.part.Name, r.cells, #r.holes,
 			r.fallback and "_FALLBACK" or "")
 		sub.Parent = folder
-		local outerCol = r.fallback and Color3.fromRGB(255, 170, 60) or Color3.fromRGB(255, 80, 80)
-		local v = r.verts
-		for i = 1, #v do
-			bar(v[i], v[i % #v + 1], outerCol, 0.18, sub)
-		end
-		for _, hr in ipairs(r.holes) do
-			local hv = hr.verts
-			for i = 1, #hv do
-				bar(hv[i], hv[i % #hv + 1], Color3.fromRGB(80, 200, 255), 0.18, sub)
+		local function drawRing(v: {Vector3}, cls: {string}?)
+			for i = 1, #v do
+				local k = cls and cls[i]
+				bar(v[i], v[i % #v + 1], (k and COL[k]) or GREY, 0.18, sub)
 			end
 		end
+		drawRing(r.verts, r.cls)
+		for _, hr in ipairs(r.holes) do drawRing(hr.verts, hr.cls) end
 	end
 	return folder
 end
