@@ -762,13 +762,8 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					stats.bevels += 1
 					local f1, f2 = footOn(l1, anchor), footOn(l2, anchor)
 					if len(sub(f2, f1)) < c.minSegLen then
-						-- Collapse onto the ANCHOR, not onto the midpoint of the two
-						-- feet. The anchor is a boundary node's own centre, so the
-						-- corner lands on a node instead of between two projections
-						-- of it -- collapsing to the midpoint fixed the twitch but
-						-- pushed 62 more nodes over half a stud from the boundary.
 						stats.bevelsCollapsed += 1
-						put(anchor, leaving)
+						put({ x = (f1.x + f2.x) * 0.5, z = (f1.z + f2.z) * 0.5 }, leaving)
 					else
 						put(f1, leaving)
 						put(f2, leaving)
