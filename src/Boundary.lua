@@ -470,14 +470,17 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 			local a = segs[k]
 			local b = segs[k % #segs + 1]
 			if a ~= b and a.class == b.class and contiguous(a.idx) and contiguous(b.idx)
-				and a.idx[#a.idx] + 1 == b.idx[1] and #a.idx >= 2 and #b.idx >= 2
+				-- adjacent runs SHARE their boundary node: the fit restarts with
+				-- `cur = { cur[#cur], i }`, so a's last index is b's first
+				and a.idx[#a.idx] == b.idx[1] and #a.idx >= 2 and #b.idx >= 2
 			then
 				local lo, hi = a.idx[1], b.idx[#b.idx]
 				local function scoreAt(cut: number): number?
-					if cut - lo + 1 < 2 or hi - cut < 2 then return nil end
+					-- the cut node belongs to BOTH runs, as it does in the fit
+					if cut - lo + 1 < 2 or hi - cut + 1 < 2 then return nil end
 					local ia, ib = {}, {}
 					for i = lo, cut do ia[#ia + 1] = i end
-					for i = cut + 1, hi do ib[#ib + 1] = i end
+					for i = cut, hi do ib[#ib + 1] = i end
 					local ca, da = fitLine(pts, ia)
 					local cb, db = fitLine(pts, ib)
 					return math.max(maxResidual(pts, ia, ca, da), maxResidual(pts, ib, cb, db))
@@ -495,7 +498,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 					if bestCut ~= cut0 then
 						local ia, ib = {}, {}
 						for i = lo, bestCut do ia[#ia + 1] = i end
-						for i = bestCut + 1, hi do ib[#ib + 1] = i end
+						for i = bestCut, hi do ib[#ib + 1] = i end
 						local ca, da = fitLine(pts, ia)
 						local cb, db = fitLine(pts, ib)
 						segs[k] = { idx = ia, cen = ca, dir = da, class = a.class }
