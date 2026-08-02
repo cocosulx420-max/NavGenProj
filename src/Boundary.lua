@@ -876,9 +876,23 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 				local y, d = nearestCell(pts[i], -math.huge, math.huge)
 				free[i], freeD[i] = y or cells[1].y, d
 			end
+			-- Seeding on the single closest vertex is not enough on its own: a
+			-- ring around a building's footprint has one vertex whose closest
+			-- cell IS the roof, at distance zero, and pinning there drags the
+			-- whole ground-level ring ten studs up. So take the height the ring
+			-- MOSTLY agrees on first -- the largest cluster of unconstrained
+			-- picks within a step of each other -- and seed at the closest
+			-- vertex holding it. One vertex can no longer outvote the loop.
 			local seed, seedD = 1, math.huge
+			local bestVotes = -1
 			for i = 1, n do
-				if freeD[i] < seedD then seed, seedD = i, freeD[i] end
+				local votes = 0
+				for j = 1, n do
+					if math.abs(free[j] - free[i]) <= c.stepTol then votes += 1 end
+				end
+				if votes > bestVotes or (votes == bestVotes and freeD[i] < seedD) then
+					seed, seedD, bestVotes = i, freeD[i], votes
+				end
 			end
 
 			local out = table.create(n)
