@@ -11,6 +11,11 @@ export type Cell = {
 	slope: number,            -- degrees from world-up
 	clearance: number,        -- studs of vertical headroom (capped)
 	cover: Instance?,
+	-- Set by classifyNodes. Bitmasks over DIR8, plus the booleans they imply.
+	wallMask: number?,        -- directions with a surface standing above us
+	dropMask: number?,        -- directions with nothing to stand on
+	wall: boolean?,
+	dropoff: boolean?,
 }
 
 export type DeadCell = {
@@ -36,6 +41,7 @@ export type Grid = {
 
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
+	stepTol: number?, probeRadius: number?,
 }
 
 local DEFAULT = {
@@ -43,6 +49,14 @@ local DEFAULT = {
 	maxSlope = 65,      -- max walkable slope (deg); Cocosulx-tested
 	clearCap = 20,      -- clearance raycast cap
 	minClearance = 1.5, -- below this a cell isn't standable floor (crawl minimum)
+	stepTol = 2.2,      -- height difference still counted as continuous floor
+	-- How far from the expected neighbour position a foreign grid's cell may sit
+	-- and still count as that neighbour. A neighbour on another part's grid is
+	-- on a different lattice at a different angle, so it never lands on our
+	-- sample point: the nearest cell of an arbitrarily placed lattice of pitch
+	-- `step` can be up to step*sqrt(2)/2 ~= 0.707 away. Anything below that and
+	-- a foreign floor reads as air, which turns every part join into a dropoff.
+	probeRadius = 0.75,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -194,6 +208,114 @@ local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 	return grid
 end
 
+-- The 8 local directions, starting east and going counter-clockwise.
+local DIR8 = {
+	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+}
+
+-- World XZ bucket, 1 stud, holding every cell and every dead cell so a
+-- neighbour can be found without knowing which grid owns it.
+local function buildWorldIndex(grids: any)
+	local live: {[string]: {any}} = {}
+	local dead: {[string]: {any}} = {}
+	local function push(t, pos, v)
+		local k = math.floor(pos.X) .. ":" .. math.floor(pos.Z)
+		local b = t[k]
+		if not b then b = {}; t[k] = b end
+		b[#b + 1] = v
+	end
+	for part, g in pairs(grids) do
+		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = part }) end
+		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = part }) end
+	end
+	return live, dead
+end
+
+-- Where the neighbour in local direction d would be, in world space. Block
+-- grids step along their own face axes; fallback grids are world-aligned.
+local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
+	if not g.fallback and g.u and g.v then
+		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
+	end
+	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
+end
+
+-- Mark every cell with the directions in which it has a wall and the
+-- directions in which it has air.
+--
+--   wall    -- something stands above us there (a surface higher than stepTol,
+--             or a cell killed by cover overhead)
+--   dropoff -- nothing to stand on there: no surface within a step, in any grid
+--
+-- A cell can be both: a ledge running along the foot of a wall is the ordinary
+-- case. Neither means the floor simply continues, whether or not it continues
+-- onto a different part.
+function LocalGrid.classifyNodes(data: any, cfg: Config?)
+	local c = merged(cfg)
+	if data.config then
+		c.step = data.config.step or c.step
+		c.stepTol = (cfg and cfg.stepTol) or data.config.stepTol or c.stepTol
+	end
+	local live, dead = buildWorldIndex(data.grids)
+	local r2 = (c.probeRadius * c.step) ^ 2
+	local nWall, nDrop, nBoth = 0, 0, 0
+
+	for _, g in pairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			local wallMask, dropMask = 0, 0
+			for bit, d in ipairs(DIR8) do
+				local p = neighbourPos(g, cell, d)
+				local bx, bz = math.floor(p.X), math.floor(p.Z)
+				local floor, above = false, false
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local q = e.cell.pos
+							local dx, dz = q.X - p.X, q.Z - p.Z
+							if dx * dx + dz * dz <= r2 then
+								local dy = q.Y - cell.pos.Y
+								if math.abs(dy) <= c.stepTol then
+									floor = true
+								elseif dy > c.stepTol then
+									above = true
+								end
+							end
+						end
+					end
+				end
+				if not floor then
+					-- a cell killed by something overhead is that something's wall
+					if not above then
+						for ox = -1, 1 do
+							for oz = -1, 1 do
+								for _, e in ipairs(dead[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+									local q = e.dead.pos
+									local dx, dz = q.X - p.X, q.Z - p.Z
+									if dx * dx + dz * dz <= r2 and e.dead.killer
+										and math.abs(q.Y - cell.pos.Y) <= c.stepTol then
+										above = true
+									end
+								end
+							end
+						end
+					end
+					local m = bit32.lshift(1, bit - 1)
+					if above then wallMask = bit32.bor(wallMask, m) else dropMask = bit32.bor(dropMask, m) end
+				end
+			end
+			cell.wallMask, cell.dropMask = wallMask, dropMask
+			cell.wall, cell.dropoff = wallMask ~= 0, dropMask ~= 0
+			if cell.wall then nWall += 1 end
+			if cell.dropoff then nDrop += 1 end
+			if cell.wall and cell.dropoff then nBoth += 1 end
+		end
+	end
+
+	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
+	return data
+end
+
 -- Build per-part local grids from an existing floor extraction.
 function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local c = merged(cfg)
@@ -232,10 +354,53 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
-	return {
+	local data = {
 		grids = grids, config = c,
 		stats = { parts = nBlock + nFallback, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
 	}
+	LocalGrid.classifyNodes(data, cfg)
+	return data
+end
+
+-- Debug viz for classifyNodes: red = wall, blue = dropoff, purple = both,
+-- grey = interior. Tiles are oriented to their grid like the main viz.
+function LocalGrid.visualizeClasses(data: any, parent: Instance?)
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("NodeClasses")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "NodeClasses"; folder.Parent = dbg
+
+	local WALL = Color3.fromRGB(255, 70, 70)
+	local DROP = Color3.fromRGB(70, 160, 255)
+	local BOTH = Color3.fromRGB(220, 90, 255)
+	local PLAIN = Color3.fromRGB(70, 70, 78)
+	local step = data.config.step
+	for _, g in pairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			local dot = Instance.new("Part")
+			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
+			dot.Material = Enum.Material.Neon
+			local col, w = PLAIN, 0.55
+			if cell.wall and cell.dropoff then col, w = BOTH, 0.9
+			elseif cell.wall then col, w = WALL, 0.9
+			elseif cell.dropoff then col, w = DROP, 0.9 end
+			dot.Color = col
+			dot.Transparency = (col == PLAIN) and 0.75 or 0
+			dot.Size = Vector3.new(w * step, 0.08, w * step)
+			if not g.fallback and g.n and g.u then
+				dot.CFrame = CFrame.fromMatrix(cell.pos + Vector3.new(0, 0.12, 0), g.u, g.n)
+			else
+				dot.CFrame = CFrame.new(cell.pos + Vector3.new(0, 0.12, 0))
+			end
+			dot.Name = string.format("w%d_d%d", cell.wallMask or 0, cell.dropMask or 0)
+			dot.Parent = folder
+		end
+	end
+	return folder
 end
 
 -- Convenience one-call bake: Floor.build + local grids.
