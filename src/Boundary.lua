@@ -492,64 +492,45 @@ end
 --------------------------------------------------------------------------
 
 --------------------------------------------------------------------------
--- CLASSIFY A BOUNDARY EDGE — wall, dropoff, or seam
+-- READ THE CLASS OFF THE NODE
 --
--- DESIGN.md offsets WALLS ONLY: an agent must not clip masonry, but walking the
--- lip of a ledge is legitimate, and standing off from every ledge removed 12.4%
--- of SmallMap's cells from exactly the places worth keeping.
+-- LocalGrid already marks every node with the directions in which it has a wall
+-- and the directions in which it has air, over 8 local directions, using a
+-- world-space probe that copes with a neighbour living on another part's grid.
+-- This module used to re-derive that itself, with its own step tolerance -- and
+-- once the step-up allowance was removed from LocalGrid the two disagreed about
+-- what a step even is. There is one answer and it belongs to the grid.
 --
--- Per-part grids add a third class the world raster never had. Two slabs laid
--- side by side at the same height are continuous floor, but each grid stops at
--- its own rim, so BOTH emit a boundary along the join. Measured on SmallMap,
--- 41% of every boundary edge in the bake is one of these -- not a boundary at
--- all. Offsetting them would carve a wall down the middle of a flat floor, and
--- they are where one polygon hands over to the next.
---
--- Nothing here consults a Part. A seam is "another grid has a walkable cell
--- there, within a step of our height", a wall is "the cell there was killed
--- from above, or another grid's floor stands above us", and a dropoff is the
--- rest. All three are answered out of cells.
+-- The three classes the fit cares about:
+--   WALL -- masonry an agent must be stood off from
+--   DROP -- a ledge; walking its lip is legitimate and eroding every one of
+--           them removed 12.4% of SmallMap's cells at its narrowest places
+--   SEAM -- neither: the floor continues onto another part's grid. 40% of all
+--           boundary edges here. Not a boundary at all.
 --------------------------------------------------------------------------
 
 local SEAM, WALL, DROP = "seam", "wall", "drop"
 
-local function classifierFor(localData: any, c: any)
-	local world: {[string]: {any}} = {}
-	for part, g in pairs(localData.grids) do
-		for _, cell in ipairs(g.cells) do
-			local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
-			local b = world[k]
-			if not b then b = {}; world[k] = b end
-			b[#b + 1] = { y = cell.pos.Y, part = part }
-		end
+-- the four cardinal directions as bit positions in LocalGrid's DIR8
+local DIR_BIT: {[string]: number} = {
+	["1:0"] = 1, ["0:1"] = 3, ["-1:0"] = 5, ["0:-1"] = 7,
+}
+
+local function classOf(g: any, s: any): string
+	local cell = s.cell
+	local bitIdx = DIR_BIT[s.dir[1] .. ":" .. s.dir[2]]
+	if not bitIdx or not cell.wallMask then
+		-- grid was not classified; fall back to what this stage can see alone
+		return g.deadIndex[s.nu .. ":" .. s.nv] and WALL or DROP
 	end
-	return function(g: any, s: any): string
-		local step = g.step
-		local d = s.dir
-		local wp
-		if not g.fallback and g.n then
-			wp = s.cell.pos + g.u * (d[1] * step) + g.v * (d[2] * step)
-		else
-			wp = s.cell.pos + Vector3.new(d[1] * step, 0, d[2] * step)
-		end
-		local bucket = world[math.floor(wp.X) .. ":" .. math.floor(wp.Z)]
-		if bucket then
-			for _, e in ipairs(bucket) do
-				if e.part ~= g.part then
-					local dy = e.y - s.cell.pos.Y
-					if math.abs(dy) <= c.stepTol then return SEAM end
-					-- another surface standing above us is masonry, same as a
-					-- neighbouring column would be
-					if dy > c.stepTol then return WALL end
-				end
-			end
-		end
-		if g.deadIndex[s.nu .. ":" .. s.nv] then return WALL end
-		return DROP
-	end
+	local m = bit32.lshift(1, bitIdx - 1)
+	if bit32.band(cell.wallMask, m) ~= 0 then return WALL end
+	if bit32.band(cell.dropMask, m) ~= 0 then return DROP end
+	-- neither: LocalGrid found floor continuing there, on some other grid
+	return SEAM
 end
 
-local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
+local function ringsOfGrid(g: any, c: any, stats: any)
 	local isBlock = not g.fallback and g.n ~= nil
 	local step = g.step
 
@@ -601,7 +582,7 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 		local cls: {string} = {}
 		local lastCell, lastCls = nil, nil
 		for _, s in ipairs(loop) do
-			local k = classify(g, s)
+			local k = classOf(g, s)
 			-- Collapse the duplicate a corner cell contributes, but ONLY while the
 			-- class holds: a cell with a wall on one side and a seam on the other
 			-- has to appear twice or one of the two runs loses its start point.
@@ -641,22 +622,29 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 		end
 
 		----------------------------------------------------------------
-		-- STEP 5 — bias the fit inward
+		-- A LINE SITS BALANCED AMONG ITS NODES.
 		--
-		-- A fit can sit outward of the cells it was fitted to, which hands back
-		-- ground that is not walkable. Translate each line inward until no
-		-- accepted cell centre lies outward of it. Without this the safety
-		-- guarantee is probabilistic; with it, it is exact.
-		----------------------------------------------------------------
+		-- The fit is total least squares, so the line it returns already
+		-- minimises the summed squared distance to its own nodes: it runs down
+		-- the middle of a staircased run rather than favouring either side. That
+		-- is the property to keep.
+		--
+		-- What used to happen next destroyed it. The line was translated outward
+		-- until it touched the OUTERMOST node -- nominally "bias inward", to
+		-- guarantee no node lay outside the polygon -- which is precisely leaning
+		-- hard toward a few nodes and ignoring the rest. On a staircase it parked
+		-- the line on the outer corners of the steps instead of through them.
+		--
+		-- So the line is left where the fit put it, through the centroid. The
+		-- boundary then runs through the middle of the boundary nodes, which
+		-- gives up about half a cell of ground: erosion, and the safe direction.
 		local lines: {any} = {}
 		for _, sg in ipairs(segs) do
 			local nrm = outwardOf(sg.dir)
-			local cval = -math.huge
-			for _, i in ipairs(sg.idx) do
-				local d = dot(pts[i], nrm)
-				if d > cval then cval = d end
-			end
-			lines[#lines + 1] = { n = nrm, c = cval, anchor = pts[sg.idx[#sg.idx]], class = sg.class }
+			lines[#lines + 1] = {
+				n = nrm, c = dot(sg.cen, nrm),
+				anchor = pts[sg.idx[#sg.idx]], class = sg.class,
+			}
 		end
 
 		----------------------------------------------------------------
@@ -779,7 +767,6 @@ end
 function Boundary.fromLocal(localData: any, cfg: Config?)
 	local c = merged(cfg)
 	local t0 = os.clock()
-	local classify = classifierFor(localData, c)
 
 	local regions: {any} = {}
 	local stats = {
@@ -797,7 +784,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 	for part, g in pairs(localData.grids) do
 		stats.parts += 1
 		if g.fallback then stats.fallback += 1 else stats.block += 1 end
-		local rings = ringsOfGrid(g, c, stats, classify)
+		local rings = ringsOfGrid(g, c, stats)
 		if #rings == 0 then
 			stats.emptyGrids += 1
 			continue
