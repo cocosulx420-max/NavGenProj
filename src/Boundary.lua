@@ -38,9 +38,11 @@ export type Config = {
 	-- A block grid is a single plane and never consults this.
 	stepTol: number?,
 
-	-- STEP 4. The maximum perpendicular distance a boundary cell centre may sit
-	-- from its segment's line. One cell: anything the mask can express as
-	-- "straight" is straight.
+	-- STEP 4. The maximum perpendicular distance a boundary node may sit from
+	-- its segment's line. A whole cell is too loose in practice: it lets a line
+	-- run a stud clear of nodes it claims, which reads as the line ignoring
+	-- them. Half a cell puts 223 -> 49 nodes over half a stud from the boundary
+	-- for 21 more segments; tightening further buys nothing.
 	fitTol: number?,
 
 	-- STEP 8. Runs shorter than this are absorbed, and runs whose directions
@@ -63,13 +65,12 @@ export type Config = {
 
 local DEFAULT = {
 	stepTol = 2.2,
-	fitTol = 1.0,
+	fitTol = 0.5,
 	minSegLen = 1.0,
 	collinearDeg = 5,
 	miterLimit = 3.0,
 	maxGap = 3.0,
 	mergeNeedsFit = true,
-	overrun = 1.0,
 }
 
 local function merged(cfg): any
@@ -672,16 +673,8 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				local mean = math.abs(acc / #sg.idx)
 				if mean > stats.worstLean then stats.worstLean = mean end
 			end
-			-- how far this run's OWN nodes reach along its own direction
-			local tMin, tMax = math.huge, -math.huge
-			for _, i in ipairs(sg.idx) do
-				local t = dot(sub(pts[i], sg.cen), sg.dir)
-				if t < tMin then tMin = t end
-				if t > tMax then tMax = t end
-			end
 			lines[#lines + 1] = {
 				n = nrm, c = cval, cen = sg.cen, dir = sg.dir,
-				tMin = tMin, tMax = tMax,
 				anchor = pts[sg.idx[#sg.idx]], class = sg.class,
 			}
 		end
@@ -769,36 +762,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 						put(f2, leaving)
 					end
 				else
-					-- AN EDGE MAY NOT RUN PAST ITS OWN NODES.
-					--
-					-- Two lines can be a stud apart in fit and still cross a long
-					-- way beyond where either run's nodes stop, if they are nearly
-					-- parallel. The line follows its nodes; the drawn edge then
-					-- shoots off across ground no node vouches for -- 96 of 401
-					-- edges had a midpoint more than 2 studs from any node, the
-					-- worst 17 studs out.
-					--
-					-- So the crossing is clamped to each run's own span. Where it
-					-- sits inside both, it is a real corner and stands. Where it
-					-- does not, the boundary stops where its evidence stops and
-					-- the two ends are joined across.
-					local ip = { x = px, z = pz }
-					local t1 = dot(sub(ip, l1.cen), l1.dir)
-					local t2 = dot(sub(ip, l2.cen), l2.dir)
-					local lim = c.overrun
-					local over1 = t1 > l1.tMax + lim
-					local over2 = t2 < l2.tMin - lim
-					if over1 or over2 then
-						stats.cornersTrimmed += 1
-						local e1 = l1.cen
-						local a1 = math.min(t1, l1.tMax + lim)
-						put({ x = e1.x + l1.dir.x * a1, z = e1.z + l1.dir.z * a1 }, leaving)
-						local e2 = l2.cen
-						local a2 = math.max(t2, l2.tMin - lim)
-						put({ x = e2.x + l2.dir.x * a2, z = e2.z + l2.dir.z * a2 }, leaving)
-					else
-						put(ip, leaving)
-					end
+					put({ x = px, z = pz }, leaving)
 				end
 			end
 		end
@@ -873,7 +837,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
-		worstLean = 0, worstFit = 0, linesOffNodes = 0, cornersTrimmed = 0,
+		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
