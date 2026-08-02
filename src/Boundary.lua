@@ -809,6 +809,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		----------------------------------------------------------------
 		local verts: {P2} = {}
 		local vcls: {string} = {}
+		local vhow: {string} = {}
 
 		local anchorNow: P2 = { x = 0, z = 0 }
 		local function footOn(L: any, p: P2): P2
@@ -823,6 +824,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- 125. The anchor is a boundary CELL CENTRE, so it is on a live cell by
 		-- construction -- fall all the way back to it and the polygon cannot
 		-- leave the mask at a corner at all.
+		local how = "cross"
 		local function put(p: P2, k: string)
 			if not inMask(p.x, p.z) then
 				stats.cornersClamped += 1
@@ -838,6 +840,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			end
 			verts[#verts + 1] = p
 			vcls[#vcls + 1] = k
+			vhow[#vhow + 1] = how
 		end
 		local nL = #lines
 		for i = 1, nL do
@@ -853,6 +856,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			if math.abs(det) < 1e-6 then
 				-- near-parallel: fall back to the foot of the anchor on l1
 				stats.unstableCorners += 1
+				how = "parallel"
 				put(footOn(l1, anchor), leaving)
 			else
 				local px = (l1.c * l2.n.z - l2.c * l1.n.z) / det
@@ -878,6 +882,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					-- on SmallMap, one of them 0.18 studs between neighbours 3.4
 					-- degrees apart. There is no corner being described there.
 					stats.bevels += 1
+					how = outside and "bevel-offmask" or "bevel-miter"
 					local f1, f2 = footOn(l1, anchor), footOn(l2, anchor)
 					if len(sub(f2, f1)) < c.minSegLen then
 						stats.bevelsCollapsed += 1
@@ -887,6 +892,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 						put(f2, leaving)
 					end
 				else
+					how = "cross"
 					put({ x = px, z = pz }, leaving)
 				end
 			end
@@ -901,6 +907,10 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
 			end
 			continue
+		end
+		if c.debugPart and g.part == c.debugPart and stats.debug then
+			local last = stats.debug[#stats.debug]
+			last.how, last.faceVerts = vhow, verts
 		end
 		rings[#rings + 1] = { pts2 = verts, cls = vcls, area = signed2(verts) }
 	end
