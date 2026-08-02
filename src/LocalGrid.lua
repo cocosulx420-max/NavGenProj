@@ -41,7 +41,7 @@ export type Grid = {
 
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
-	stepTol: number?, probeRadius: number?,
+	flushTol: number?, probeRadius: number?,
 }
 
 local DEFAULT = {
@@ -49,7 +49,11 @@ local DEFAULT = {
 	maxSlope = 65,      -- max walkable slope (deg); Cocosulx-tested
 	clearCap = 20,      -- clearance raycast cap
 	minClearance = 1.5, -- below this a cell isn't standable floor (crawl minimum)
-	stepTol = 2.2,      -- height difference still counted as continuous floor
+	-- How far a neighbouring surface may sit from where THIS grid's surface
+	-- would continue, and still count as the same floor. Not a step height: a
+	-- step up of any size is a wall now, and pathfinding deals with climbing it.
+	-- It is only slack for authoring mismatch and raycast noise.
+	flushTol = 0.5,
 	-- How far from the expected neighbour position a foreign grid's cell may sit
 	-- and still count as that neighbour. A neighbour on another part's grid is
 	-- on a different lattice at a different angle, so it never lands on our
@@ -255,10 +259,11 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
 		c.step = data.config.step or c.step
-		c.stepTol = (cfg and cfg.stepTol) or data.config.stepTol or c.stepTol
+		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
 	end
 	local live, dead = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
+	local tol = c.flushTol
 	local nWall, nDrop, nBoth = 0, 0, 0
 
 	for _, g in pairs(data.grids) do
@@ -286,10 +291,17 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
 							if dx * dx + dz * dz <= r2 then
-								local dy = q.Y - cell.pos.Y
-								if math.abs(dy) <= c.stepTol then
+								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
+								-- not against our own height. `p` lies on this grid's
+								-- own plane, so on a tilted slab the next cell along
+								-- is at dy = 0 however steep the slab is. Comparing to
+								-- cell.pos.Y instead would make a 65-degree ramp's own
+								-- cells read as walls and dropoffs the moment the
+								-- tolerance dropped below its per-cell rise.
+								local dy = q.Y - p.Y
+								if math.abs(dy) <= tol then
 									floor = true
-								elseif dy > c.stepTol then
+								elseif dy > tol then
 									above = true
 								else
 									below = true
@@ -308,7 +320,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 									local q = e.dead.pos
 									local dx, dz = q.X - p.X, q.Z - p.Z
 									if dx * dx + dz * dz <= r2 and e.dead.killer
-										and math.abs(q.Y - cell.pos.Y) <= c.stepTol then
+										and math.abs(q.Y - p.Y) <= tol then
 										above = true
 									end
 								end
