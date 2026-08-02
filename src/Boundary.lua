@@ -651,19 +651,40 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 		----------------------------------------------------------------
 		local verts: {P2} = {}
 		local vcls: {string} = {}
+
+		local anchorNow: P2 = { x = 0, z = 0 }
+		local function footOn(L: any, p: P2): P2
+			local d = L.c - dot(p, L.n)
+			return { x = p.x + L.n.x * d, z = p.z + L.n.z * d }
+		end
+		-- THE LAST RESORT IS THE CELL CENTRE ITSELF.
+		--
+		-- Refusing an off-floor intersection is not enough on its own: the bevel
+		-- that replaces it projects the anchor onto each line, and those feet can
+		-- sit off the floor too. Fixing only the intersection moved 123 edges to
+		-- 125. The anchor is a boundary CELL CENTRE, so it is on a live cell by
+		-- construction -- fall all the way back to it and the polygon cannot
+		-- leave the mask at a corner at all.
+		local function put(p: P2, k: string)
+			if not inMask(p.x, p.z) then
+				stats.cornersClamped += 1
+				p = anchorNow
+			end
+			verts[#verts + 1] = p
+			vcls[#vcls + 1] = k
+		end
 		local nL = #lines
 		for i = 1, nL do
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
 			-- the edge LEAVING this corner runs along l2, so it carries l2's class
 			local leaving = l2.class
+			anchorNow = anchor
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
 			local anchor = l1.anchor
 			if math.abs(det) < 1e-6 then
 				-- near-parallel: fall back to the foot of the anchor on l1
 				stats.unstableCorners += 1
-				local s = l1.c - dot(anchor, l1.n)
-				verts[#verts + 1] = { x = anchor.x + l1.n.x * s, z = anchor.z + l1.n.z * s }
-				vcls[#vcls + 1] = leaving
+				put(footOn(l1, anchor), leaving)
 			else
 				local px = (l1.c * l2.n.z - l2.c * l1.n.z) / det
 				local pz = (l1.n.x * l2.c - l2.n.x * l1.c) / det
@@ -680,15 +701,10 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 					-- MITER LIMIT. An acute corner throws the intersection
 					-- arbitrarily far out; bevel across it instead.
 					stats.bevels += 1
-					local s1 = l1.c - dot(anchor, l1.n)
-					verts[#verts + 1] = { x = anchor.x + l1.n.x * s1, z = anchor.z + l1.n.z * s1 }
-					vcls[#vcls + 1] = leaving
-					local s2 = l2.c - dot(anchor, l2.n)
-					verts[#verts + 1] = { x = anchor.x + l2.n.x * s2, z = anchor.z + l2.n.z * s2 }
-					vcls[#vcls + 1] = leaving
+					put(footOn(l1, anchor), leaving)
+					put(footOn(l2, anchor), leaving)
 				else
-					verts[#verts + 1] = { x = px, z = pz }
-					vcls[#vcls + 1] = leaving
+					put({ x = px, z = pz }, leaving)
 				end
 			end
 		end
@@ -762,7 +778,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- boundary edges by class; seam edges are joins, not boundaries
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
-		cornersOffMask = 0,
+		cornersOffMask = 0, cornersClamped = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
