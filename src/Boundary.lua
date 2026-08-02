@@ -543,6 +543,7 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		severed = 0, severedLayers = 0, annihilated = 0, droppedCells = 0,
 		worstResidual = 0,
+		heightClamped = 0, heightUnreachable = 0,
 	}
 	local regions: {any} = {}
 
@@ -812,8 +813,13 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		-- arbitrary height. That is what drew the vertical fences at the wall
 		-- bases: one vertex of a flat ring teleporting to whatever height cell 1
 		-- happened to sit at. Search wider, then fall back to the genuinely
-		-- nearest cell rather than the first one.
-		local function heightAt(p: P2): number
+		-- nearest cell rather than the first one -- and, per `toWorld` below,
+		-- never further vertically than a walkable slope could have carried the
+		-- ring there.
+		-- Nearest cell of this layer whose height falls inside [lo, hi]. Returns
+		-- nil when the layer has no such cell anywhere, so the caller can decide
+		-- what to do rather than being handed a wrong number.
+		local function nearestCell(p: P2, lo: number, hi: number): (number?, number)
 			local bx, bz = math.floor(p.x), math.floor(p.z)
 			for rad = 0, 8 do
 				local best, bestD = nil, math.huge
@@ -822,25 +828,76 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 						if math.max(math.abs(dx), math.abs(dz)) == rad then
 							local k = (bx + dx) .. ":" .. (bz + dz)
 							local y = cellY[k]
-							if y then
+							if y and y >= lo and y <= hi then
 								local d = (bx + dx + 0.5 - p.x) ^ 2 + (bz + dz + 0.5 - p.z) ^ 2
 								if d < bestD then best, bestD = y, d end
 							end
 						end
 					end
 				end
-				if best then return best end
+				if best then return best, bestD end
 			end
-			local best, bestD = cells[1].y, math.huge
+			local best, bestD = nil, math.huge
 			for _, cell in ipairs(cells) do
-				local d = (cell.ix + 0.5 - p.x) ^ 2 + (cell.iz + 0.5 - p.z) ^ 2
-				if d < bestD then best, bestD = cell.y, d end
+				if cell.y >= lo and cell.y <= hi then
+					local d = (cell.ix + 0.5 - p.x) ^ 2 + (cell.iz + 0.5 - p.z) ^ 2
+					if d < bestD then best, bestD = cell.y, d end
+				end
 			end
-			return best
+			return best, bestD
 		end
+
+		-- VERTICAL CONTINUITY, and it is what killed the picket fences.
+		--
+		-- Nearest-cell-in-XZ is the right height only while the layer is single
+		-- valued near the vertex. A layer legitimately spans a whole building --
+		-- ground, stairs and roof are one connected, x:z-injective component --
+		-- so a vertex sitting on the roof's edge has ground cells 1 stud away in
+		-- XZ and 10 studs below. Nearest-in-XZ picked those, and the ring
+		-- teleported down the wall and back: on SmallMap 58 of 102 holes had two
+		-- CONSECUTIVE vertices, 2-4 studs apart on the ground, 10 studs apart in
+		-- height. Drawn, that is a fence of vertical bars down every facade.
+		--
+		-- A ring is a loop of walkable boundary, so the constraint is just the
+		-- walkable slope: over dxz studs of ground the height may move by at most
+		-- stepTol per stud, which is the same 65-degree limit layering uses. Walk
+		-- the loop from the vertex whose unconstrained answer is most trustworthy
+		-- -- the one sitting closest to a cell of its own layer -- and let each
+		-- vertex pick the nearest cell that its predecessor's height can reach.
+		--
+		-- The constraint is never allowed to FAIL a vertex: if no cell in the
+		-- layer is reachable, the unconstrained nearest is still better than
+		-- nothing, and the fallback is counted rather than hidden.
 		local function toWorld(ring: any): {Vector3}
-			local out = {}
-			for i, p in ipairs(ring.pts) do out[i] = Vector3.new(p.x, heightAt(p), p.z) end
+			local pts = ring.pts
+			local n = #pts
+			local free, freeD = {}, {}
+			for i = 1, n do
+				local y, d = nearestCell(pts[i], -math.huge, math.huge)
+				free[i], freeD[i] = y or cells[1].y, d
+			end
+			local seed, seedD = 1, math.huge
+			for i = 1, n do
+				if freeD[i] < seedD then seed, seedD = i, freeD[i] end
+			end
+
+			local out = table.create(n)
+			out[seed] = Vector3.new(pts[seed].x, free[seed], pts[seed].z)
+			local prevY = free[seed]
+			for step = 1, n - 1 do
+				local i = ((seed - 1 + step) % n) + 1
+				local prev = ((seed - 2 + step) % n) + 1
+				local rise = c.stepTol * math.max(1, len(sub(pts[i], pts[prev])))
+				local y = nearestCell(pts[i], prevY - rise, prevY + rise)
+				if y then
+					if y ~= free[i] then stats.heightClamped += 1 end
+				else
+					y = free[i]
+					stats.heightUnreachable += 1
+				end
+				out[i] = Vector3.new(pts[i].x, y, pts[i].z)
+				prevY = y
+			end
 			return out
 		end
 
