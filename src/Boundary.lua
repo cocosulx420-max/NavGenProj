@@ -350,11 +350,52 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			end
 		end
 
+		-- A CORNER IS NOT ALWAYS FULLY ATTRIBUTED. Right at the meeting of two
+		-- faces the cells diagonally in the crook are often killed by neither
+		-- face cleanly -- or by nothing at all, where the mask simply ran out --
+		-- so a couple of edges between two long snapped runs carry no killer and
+		-- stay on the lattice. Left alone they put a stub of one-stud fragments
+		-- in the middle of an otherwise exact corner, which is what the first
+		-- version of this left behind on every building corner on SmallMap.
+		--
+		-- If the two lines either side of such a stub cross close to it, the
+		-- crossing IS the corner and the stub is quantization noise. Dropping it
+		-- moves the boundary out into the hole, which removes walkable ground
+		-- rather than inventing it, so this can only ever erode.
+		local stubMax = c.snapCells * step * 2
+		local changed = true
+		while changed and #runs >= 3 do
+			changed = false
+			for i = 1, #runs do
+				local run = runs[i]
+				if not run.line then
+					local prev = runs[(i - 2) % #runs + 1]
+					local nxt = runs[i % #runs + 1]
+					if prev.line and nxt.line and prev.line ~= nxt.line then
+						local L = 0
+						for _, e in ipairs(run.edges) do
+							L += math.sqrt((e.b[1] - e.a[1]) ^ 2 + (e.b[2] - e.a[2]) ^ 2)
+						end
+						if L <= stubMax then
+							local ix, iy = intersect(prev.line, nxt.line)
+							local s = run.edges[1].a
+							if ix and math.abs(ix - s[1]) <= stubMax * 2 and math.abs(iy - s[2]) <= stubMax * 2 then
+								table.remove(runs, i)
+								stats.stubsDropped += 1
+								changed = true
+								break
+							end
+						end
+					end
+				end
+			end
+		end
+
 		-- Corners are where two runs meet: two snapped lines cross exactly, and
 		-- anything else keeps the lattice corner it already had. A run on a line
 		-- contributes only that corner; a run that was not snapped also
 		-- contributes its own interior points.
-		local face = {}
+		local face: {any} = {}
 		for i, run in ipairs(runs) do
 			local prev = runs[(i - 2) % #runs + 1]
 			local shared = run.edges[1].a
@@ -384,6 +425,24 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				end
 			end
 		end
+
+		-- Two runs can resolve onto points a thousandth of a stud apart -- a
+		-- projection and a crossing landing on the same corner. That is one
+		-- corner, and the turn test below cannot see it as one, so merge first.
+		local dedup = {}
+		for i = 1, #face do
+			local p = face[i]
+			local last = dedup[#dedup]
+			if not last or (p[1] - last[1]) ^ 2 + (p[2] - last[2]) ^ 2 > 1e-6 then
+				dedup[#dedup + 1] = p
+			end
+		end
+		if #dedup > 1 then
+			local a, b = dedup[1], dedup[#dedup]
+			if (a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 <= 1e-6 then dedup[#dedup] = nil end
+		end
+		face = dedup
+		if #face < 3 then continue end
 
 		-- drop points that carry no turn (a straight lattice run, or two runs that
 		-- resolved onto the same line)
@@ -421,7 +480,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		regions = 0, holes = 0, verts = 0, emptyGrids = 0,
 		-- corners recovered by crossing two real face planes, and the ones where
 		-- the planes were too near parallel to cross usefully
-		corners = 0, unstableCorners = 0,
+		corners = 0, unstableCorners = 0, stubsDropped = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
