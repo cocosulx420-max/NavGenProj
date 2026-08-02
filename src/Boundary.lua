@@ -341,11 +341,11 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	return segs
 end
 
-local function signedArea(pts: {Vector3}): number
+local function signed2(pts: {P2}): number
 	local a2 = 0
 	for i = 1, #pts do
 		local p, q = pts[i], pts[i % #pts + 1]
-		a2 += p.X * q.Z - q.X * p.Z
+		a2 += p.x * q.z - q.x * p.z
 	end
 	return a2 * 0.5
 end
@@ -390,6 +390,9 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		end
 	end
 
+	-- A ring is built in the grid's 2D face coordinates and only converted to
+	-- world once outer-vs-hole is known, because a ring that could not be fitted
+	-- is treated differently depending on which it is.
 	local rings: {any} = {}
 	for _, loop in ipairs(traceMask(g.cells, g.index, cliff)) do
 		-- Ordered boundary cell CENTRES. A corner cell contributes two edges and
@@ -404,9 +407,24 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		end
 		if #pts < 3 then continue end
 
+		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
+		-- and the old implementation hit it on 165 of 169 holes: the two long
+		-- sides of a strip narrower than fitTol sit within the tolerance of each
+		-- other, so the fit walks straight round the end without ever failing and
+		-- the whole ring collapses to one or two segments.
+		--
+		-- It is not a corner case here. This map's stair steps are 35x2 cell
+		-- strips -- 36 of them, 3.6% of every walkable cell on the map -- and
+		-- silently dropping them is the one operation in this module that can
+		-- make real ground disappear. So a ring that cannot be fitted keeps its
+		-- raw lattice outline instead. Jagged, but present.
 		local segs = mergeSegments(pts, segmentLoop(pts, c), c)
 		stats.rawSegments += #segs
-		if #segs < 3 then continue end
+		if #segs < 3 then
+			stats.rawRings += 1
+			rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			continue
+		end
 
 		----------------------------------------------------------------
 		-- STEP 5 — bias the fit inward
@@ -457,12 +475,46 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				end
 			end
 		end
-		if #verts < 3 then continue end
+		if #verts < 3 then
+			stats.rawRings += 1
+			rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			continue
+		end
+		rings[#rings + 1] = { pts2 = verts, area = signed2(verts) }
+	end
 
-		local world = table.create(#verts)
-		for i, p in ipairs(verts) do world[i] = toWorld(p) end
+	-- Outer is the largest by magnitude. Magnitude, never the sign: this project
+	-- has been bitten by a handedness assumption before.
+	local outer = rings[1]
+	for _, r in ipairs(rings) do
+		if math.abs(r.area) > math.abs(outer.area) then outer = r end
+	end
+
+	for _, r in ipairs(rings) do
+		-- An unfitted OUTER ring stands as it is: cell centres lie inside the
+		-- walkable cells, so the polygon is conservative already. An unfitted
+		-- HOLE is the opposite -- cell centres sit half a cell INTO the obstacle
+		-- the hole represents, so the hole would come out too small and hand
+		-- back ground that is not there. Push it out by half a cell. An obstacle
+		-- that is slightly too big is safe; one that is too small is not.
+		if r.raw and r ~= outer then
+			local cx, cz = 0, 0
+			for _, p in ipairs(r.pts2) do cx += p.x; cz += p.z end
+			cx, cz = cx / #r.pts2, cz / #r.pts2
+			for _, p in ipairs(r.pts2) do
+				local dx, dz = p.x - cx, p.z - cz
+				local m = math.sqrt(dx * dx + dz * dz)
+				if m > 1e-6 then
+					p.x += dx / m * step * 0.5
+					p.z += dz / m * step * 0.5
+				end
+			end
+		end
+		local world = table.create(#r.pts2)
+		for i, p in ipairs(r.pts2) do world[i] = toWorld(p) end
+		r.verts = world
+		r.outer = (r == outer)
 		stats.segments += #world
-		rings[#rings + 1] = { verts = world, area = signedArea(world) }
 	end
 	return rings
 end
@@ -480,6 +532,8 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		parts = 0, block = 0, fallback = 0,
 		regions = 0, holes = 0, verts = 0, emptyGrids = 0,
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
+		-- rings the fit could not resolve, kept as their raw lattice outline
+		rawRings = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
@@ -490,11 +544,9 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 			stats.emptyGrids += 1
 			continue
 		end
-		-- Largest magnitude is the outer ring. Magnitude, never the sign: this
-		-- project has been bitten by a handedness assumption before.
 		local outer = rings[1]
 		for _, r in ipairs(rings) do
-			if math.abs(r.area) > math.abs(outer.area) then outer = r end
+			if r.outer then outer = r end
 		end
 		local region = {
 			part = part,
