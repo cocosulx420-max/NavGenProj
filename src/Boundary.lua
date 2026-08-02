@@ -287,6 +287,41 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		end
 	end
 
+	-- ONE PLANE IS ONE LINE, EVEN WHEN SEVERAL PARTS SUPPLY IT.
+	--
+	-- A flight of stairs on this map is not one part; it is nine 1x30 blocks
+	-- stacked in a row. They all end on the SAME plane -- measured on SmallMap's
+	-- 53-degree flight, all nine agree on A, B and C to six decimals -- so the
+	-- foot of the staircase is a single straight edge of the ground's hole.
+	--
+	-- But each block is a different killer and produced its own line table, and
+	-- runs were grouped by table identity. So the walk saw a new line at every
+	-- step, tried to cross two lines that were the same line, got a zero
+	-- determinant, and fell back to the lattice corner -- leaving a 0.7-to-1.0
+	-- stud jog at every step boundary along an edge that is perfectly straight.
+	-- That was every one of the unstable corners on the map.
+	--
+	-- So lines are canonicalised into a pool per grid: a newly computed line that
+	-- is collinear with one already in the pool IS that one. Identity then means
+	-- what the grouping always assumed it meant, and no tolerance leaks past this
+	-- point -- downstream still only ever compares tables.
+	local pool: {any} = {}
+	local function canonical(L: any)
+		-- orient consistently, or a plane and the same plane faced the other way
+		-- compare as different
+		if L.A < -1e-9 or (math.abs(L.A) <= 1e-9 and L.B < 0) then
+			L.A, L.B, L.C = -L.A, -L.B, -L.C
+		end
+		for _, P in ipairs(pool) do
+			-- within a twentieth of a degree and a twentieth of a stud
+			if P.A * L.A + P.B * L.B > 0.9999996 and math.abs(P.C - L.C) <= 0.05 then
+				return P
+			end
+		end
+		pool[#pool + 1] = L
+		return L
+	end
+
 	-- A killer's side lines, computed once per killer per grid.
 	local linesOf: {[Instance]: any} = {}
 	local function killerLines(k: Instance?)
@@ -298,7 +333,13 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- that the geometry does not fill would hand back ground that is not
 		-- there. Those keep the lattice outline, which is conservative.
 		local ok = k:IsA("Part") and (k :: any).Shape == Enum.PartType.Block
-		local lines = ok and sideLines(k :: BasePart, g.origin, g.u, g.v) or false
+		local lines: any = false
+		if ok then
+			lines = {}
+			for _, L in ipairs(sideLines(k :: BasePart, g.origin, g.u, g.v)) do
+				lines[#lines + 1] = canonical(L)
+			end
+		end
 		linesOf[k] = lines
 		return lines ~= false and lines or nil
 	end
