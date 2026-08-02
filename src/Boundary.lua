@@ -602,8 +602,27 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- silently dropping them is the one operation in this module that can
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
-		local segs = mergeSegments(pts, segmentLoop(pts, c, cls), c)
+		local rawSegs = segmentLoop(pts, c, cls)
+		local segs = mergeSegments(pts, rawSegs, c)
 		stats.rawSegments += #segs
+		if c.debugPart and g.part == c.debugPart then
+			local function snap(list)
+				local out = {}
+				for _, sg in ipairs(list) do
+					out[#out + 1] = {
+						first = sg.idx[1], last = sg.idx[#sg.idx], n = #sg.idx,
+						class = sg.class, cen = sg.cen, dir = sg.dir,
+						res = maxResidual(pts, sg.idx, sg.cen, sg.dir),
+					}
+				end
+				return out
+			end
+			stats.debug = stats.debug or {}
+			stats.debug[#stats.debug + 1] = {
+				points = #pts, cls = cls, pts = pts,
+				afterFit = snap(rawSegs), afterMerge = snap(segs),
+			}
+		end
 		if #segs < 3 then
 			local box = boxIfExact(pts, step)
 			if box then
