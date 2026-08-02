@@ -56,6 +56,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- Validation retry. How far the run behind an invalid edge may be pushed
+	-- forward, and how far past fitTol it may stretch to buy that.
+	expandNodes: number?,
+	expandTol: number?,
+
 
 	-- How long a stretch of foreign-typed nodes a line may ignore before that
 	-- stretch counts as a boundary of its own. This is the doorway guard: below
@@ -69,6 +74,8 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 5,
 	miterLimit = 3.0,
+	expandNodes = 6,
+	expandTol = 0.9,
 	maxGap = 3.0,
 	mergeNeedsFit = true,
 }
@@ -439,76 +446,79 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 		end
 	end
 
-	-- SLIDE THE BREAK POINT BEFORE JUDGING THE CORNER.
+	-- VALIDATE AN EDGE; IF IT FAILS, EXPAND THE ONE BEHIND IT AND RETRY.
 	--
-	-- The greedy fit is order-dependent. It walks forward and locks a run's end
-	-- at the first node whose residual fails, then leaves the next run to pick up
-	-- whatever is left -- including a node that really belonged to the run
-	-- behind. That inherited node tilts the next line, and the tilt forces
-	-- another break, so one misplaced boundary produces two segments with a
-	-- meaningless angle between them.
+	-- The greedy fit is order-dependent. It locks a run's end at the first node
+	-- whose residual fails and hands the remainder to the next run -- including a
+	-- node that belonged to the run behind. That inherited node tilts the next
+	-- line, and the tilt forces another break, so one misplaced boundary produces
+	-- two segments with a meaningless angle between them. Cocosulx marked the
+	-- case: a 50.9-stud run stops one node short and the stretch after it comes
+	-- out as two edges 11.8 degrees apart, over nodes lying on one straight line.
 	--
-	-- Measured: on SmallMap's ground slab, a 50.9-stud run stops one node short
-	-- and the following stretch comes out as two edges 11.8 degrees apart,
-	-- covering nodes that lie along a single straight line. Map-wide, 101 of 532
-	-- corners turn by less than 20 degrees.
-	--
-	-- So before deciding whether a corner is real, try moving the boundary
-	-- between each pair of runs a couple of nodes either way and keep whichever
-	-- placement fits both runs best. The merge below then sees the arrangement
-	-- the fit would have found had it not been greedy.
+	-- So an edge is checked against what makes an edge worth having: long enough
+	-- to be one, and turning enough from its predecessor to be a corner. When it
+	-- fails, the boundary behind it is pushed forward a node at a time and the
+	-- edge is rebuilt, until it passes or the room runs out. Buying that costs
+	-- the run behind some accuracy, so it may stretch to `expandTol` and no
+	-- further -- past that the cure is worse than the twitch it removes.
 	local function contiguous(idx: {number}): boolean
 		for i = 2, #idx do
 			if idx[i] ~= idx[i - 1] + 1 then return false end
 		end
 		return true
 	end
+	local cosLimV = math.cos(math.rad(c.collinearDeg))
 	local slid = true
-	while slid do
+	local guard = 0
+	while slid and guard < 200 do
 		slid = false
+		guard += 1
 		for k = 1, #segs do
 			local a = segs[k]
 			local b = segs[k % #segs + 1]
+			-- adjacent runs SHARE their boundary node: the fit restarts with
+			-- `cur = { cur[#cur], i }`, so a's last index is b's first
 			if a ~= b and a.class == b.class and contiguous(a.idx) and contiguous(b.idx)
-				-- adjacent runs SHARE their boundary node: the fit restarts with
-				-- `cur = { cur[#cur], i }`, so a's last index is b's first
 				and a.idx[#a.idx] == b.idx[1] and #a.idx >= 2 and #b.idx >= 2
 			then
 				local lo, hi = a.idx[1], b.idx[#b.idx]
-				local function scoreAt(cut: number): number?
-					-- the cut node belongs to BOTH runs, as it does in the fit
+				local function build(cut: number)
 					if cut - lo + 1 < 2 or hi - cut + 1 < 2 then return nil end
 					local ia, ib = {}, {}
 					for i = lo, cut do ia[#ia + 1] = i end
 					for i = cut, hi do ib[#ib + 1] = i end
 					local ca, da = fitLine(pts, ia)
 					local cb, db = fitLine(pts, ib)
-					return math.max(maxResidual(pts, ia, ca, da), maxResidual(pts, ib, cb, db))
+					return {
+						ia = ia, ca = ca, da = da, ra = maxResidual(pts, ia, ca, da),
+						ib = ib, cb = cb, db = db, rb = maxResidual(pts, ib, cb, db),
+					}
+				end
+				local function valid(t): boolean
+					-- long enough to be an edge, and a real turn away from the one
+					-- before it
+					return spanLength(pts, t.ib) >= c.minSegLen
+						and dot(t.da, t.db) < cosLimV
 				end
 				local cut0 = a.idx[#a.idx]
-				local best, bestCut = scoreAt(cut0), cut0
-				if best then
-					for d = -2, 2 do
-						if d ~= 0 then
-							local sc = scoreAt(cut0 + d)
-							-- a clear improvement only; ties keep the fit's own choice
-							if sc and sc < best - 1e-6 then best, bestCut = sc, cut0 + d end
+				local base = build(cut0)
+				if base and not valid(base) then
+					for d = 1, c.expandNodes do
+						local t = build(cut0 + d)
+						if not t then break end
+						if t.ra > c.expandTol then break end
+						if valid(t) then
+							segs[k] = { idx = t.ia, cen = t.ca, dir = t.da, class = a.class }
+							segs[k % #segs + 1] = { idx = t.ib, cen = t.cb, dir = t.db, class = b.class }
+							stats.breaksSlid += 1
+							slid = true
+							break
 						end
-					end
-					if bestCut ~= cut0 then
-						local ia, ib = {}, {}
-						for i = lo, bestCut do ia[#ia + 1] = i end
-						for i = bestCut, hi do ib[#ib + 1] = i end
-						local ca, da = fitLine(pts, ia)
-						local cb, db = fitLine(pts, ib)
-						segs[k] = { idx = ia, cen = ca, dir = da, class = a.class }
-						segs[k % #segs + 1] = { idx = ib, cen = cb, dir = db, class = b.class }
-						stats.breaksSlid += 1
-						slid = true
-						break
 					end
 				end
 			end
+			if slid then break end
 		end
 	end
 
