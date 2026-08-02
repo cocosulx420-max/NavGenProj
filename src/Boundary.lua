@@ -59,6 +59,12 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- A run shorter than `cornerSpan` sitting between two runs that turn through
+	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
+	-- two meet properly.
+	cornerSpan: number?,
+	cornerDeg: number?,
+
 
 	-- How long a stretch of foreign-typed nodes a line may ignore before that
 	-- stretch counts as a boundary of its own. This is the doorway guard: below
@@ -71,7 +77,9 @@ local DEFAULT = {
 	fitTol = 0.5,
 	minSegLen = 1.0,
 	collinearDeg = 20,
-	miterLimit = 3.0,
+	miterLimit = 6.0,
+	cornerSpan = 4.0,
+	cornerDeg = 45,
 	maxGap = 3.0,
 	mergeNeedsFit = false,
 	insetAll = true,
@@ -542,6 +550,38 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 		end
 	end
 
+	-- A CHAMFER ACROSS A CORNER IS NOT AN EDGE.
+	--
+	-- Where two walls meet at an angle, the nodes in the crook belong to neither
+	-- line, so the fit gives them a run of their own -- a short segment cutting
+	-- the corner off. Cocosulx marked eight of them: a 90-degree turn arriving as
+	-- 33 degrees, a 3.6-stud chamfer, then 65 degrees. The corner is one corner
+	-- and should be one vertex.
+	--
+	-- So a short run whose neighbours turn through a real corner between them is
+	-- dropped, and those neighbours are left to meet. Both lines are already
+	-- inset off their nodes, so their crossing falls on the inside of the crook:
+	-- this removes ground rather than inventing it.
+	local cosCorner = math.cos(math.rad(c.cornerDeg))
+	local cut = true
+	while cut and #segs > 3 do
+		cut = false
+		for k = 1, #segs do
+			local prev = segs[(k - 2) % #segs + 1]
+			local cur = segs[k]
+			local nxt = segs[k % #segs + 1]
+			if prev ~= cur and nxt ~= cur and prev ~= nxt
+				and spanLength(pts, cur.idx) < c.cornerSpan
+				and dot(prev.dir, nxt.dir) < cosCorner
+			then
+				table.remove(segs, k)
+				stats.chamfersCut += 1
+				cut = true
+				break
+			end
+		end
+	end
+
 	-- Near-collinear and too-short runs, absorbed until nothing changes.
 	--
 	-- This is also the rule that fixes a staircase built out of SEPARATE PARTS.
@@ -971,7 +1011,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0, singletonRuns = 0,
+		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
