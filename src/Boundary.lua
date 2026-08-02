@@ -53,6 +53,10 @@ export type Config = {
 	-- out -- the classic miter spike. Past this distance from the corner it
 	-- replaces, bevel across instead.
 	miterLimit: number?,
+
+	-- Longest class run treated as grit and absorbed into its neighbours, when
+	-- both sides agree. The classification is per cell, so it speckles.
+	speckle: number?,
 }
 
 local DEFAULT = {
@@ -61,6 +65,7 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 5,
 	miterLimit = 3.0,
+	speckle = 2,
 }
 
 local function merged(cfg): any
@@ -227,6 +232,44 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 		end
 	end
 	return loops
+end
+
+-- DESPECKLE THE CLASSIFICATION BEFORE FITTING.
+--
+-- The class is decided per cell against a neighbouring column, so it picks up
+-- grit: one cell of a long wall run reads as a seam because a neighbouring
+-- part's floor happens to reach it, one cell of a seam reads as a dropoff
+-- because the abutting grid's lattice starts half a cell over. Measured on
+-- SmallMap, 1484 of 1887 class runs -- 79% -- are one or two edges long.
+--
+-- Each speck forces the fit to close a run, and merging can never undo it
+-- because merging refuses to cross a class change. The result is hundreds of
+-- two-point segments whose lines are near parallel, which is precisely what
+-- makes a corner intersection unstable. So the grit is removed BEFORE step 4
+-- ever sees it: a run shorter than `speckle` whose neighbours on both sides
+-- agree takes their class.
+local function despeckle(cls: {string}, speckle: number)
+	local n = #cls
+	if n < 3 then return end
+	local changed = true
+	while changed do
+		changed = false
+		local i = 1
+		while i <= n do
+			local j = i
+			while j <= n and cls[j] == cls[i] do j += 1 end
+			local runLen = j - i
+			if runLen <= speckle then
+				local before = cls[(i - 2) % n + 1]
+				local after = cls[(j - 1) % n + 1]
+				if before == after and before ~= cls[i] then
+					for k = i, j - 1 do cls[k] = before end
+					changed = true
+				end
+			end
+			i = j
+		end
+	end
 end
 
 --------------------------------------------------------------------------
@@ -552,6 +595,7 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 			stats[k] += 1
 		end
 		if #pts < 3 then continue end
+		despeckle(cls, c.speckle)
 
 		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
 		-- and the old implementation hit it on 165 of 169 holes: the two long
