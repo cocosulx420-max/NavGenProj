@@ -54,9 +54,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
-	-- Longest class run treated as grit and absorbed into its neighbours, when
-	-- both sides agree. The classification is per cell, so it speckles.
-	speckle: number?,
+
+	-- How long a stretch of foreign-typed nodes a line may ignore before that
+	-- stretch counts as a boundary of its own. This is the doorway guard: below
+	-- it a speck is invisible, above it a wall cannot leap the opening.
+	maxGap: number?,
 }
 
 local DEFAULT = {
@@ -65,7 +67,7 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 5,
 	miterLimit = 3.0,
-	speckle = 2,
+	maxGap = 3.0,
 }
 
 local function merged(cfg): any
@@ -234,44 +236,6 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 	return loops
 end
 
--- DESPECKLE THE CLASSIFICATION BEFORE FITTING.
---
--- The class is decided per cell against a neighbouring column, so it picks up
--- grit: one cell of a long wall run reads as a seam because a neighbouring
--- part's floor happens to reach it, one cell of a seam reads as a dropoff
--- because the abutting grid's lattice starts half a cell over. Measured on
--- SmallMap, 1484 of 1887 class runs -- 79% -- are one or two edges long.
---
--- Each speck forces the fit to close a run, and merging can never undo it
--- because merging refuses to cross a class change. The result is hundreds of
--- two-point segments whose lines are near parallel, which is precisely what
--- makes a corner intersection unstable. So the grit is removed BEFORE step 4
--- ever sees it: a run shorter than `speckle` whose neighbours on both sides
--- agree takes their class.
-local function despeckle(cls: {string}, speckle: number)
-	local n = #cls
-	if n < 3 then return end
-	local changed = true
-	while changed do
-		changed = false
-		local i = 1
-		while i <= n do
-			local j = i
-			while j <= n and cls[j] == cls[i] do j += 1 end
-			local runLen = j - i
-			if runLen <= speckle then
-				local before = cls[(i - 2) % n + 1]
-				local after = cls[(j - 1) % n + 1]
-				if before == after and before ~= cls[i] then
-					for k = i, j - 1 do cls[k] = before end
-					changed = true
-				end
-			end
-			i = j
-		end
-	end
-end
-
 --------------------------------------------------------------------------
 -- STEP 4 — greedy line fit. THIS IS WHERE THE STAIRCASE DIES.
 --
@@ -291,55 +255,100 @@ end
 local function segmentLoop(pts: {P2}, c: any, cls: {string})
 	local n = #pts
 	local segs: {any} = {}
+	if n < 2 then return segs end
+
+	-- A LINE OWNS ONE NODE TYPE AND IGNORES THE REST.
+	--
+	-- The residual is measured against the run's OWN nodes only. A foreign node
+	-- is invisible to the fit -- not stepped over, not fitted, just not its
+	-- business -- so a single seam node sitting in the middle of a long wall no
+	-- longer closes the wall. That is what makes the classification's grit
+	-- harmless instead of fatal: 79% of class runs on this map are one or two
+	-- nodes, and previously every one of them forced a break that step 8 could
+	-- never undo.
+	--
+	-- But a line may not EXPAND INTO foreign nodes either. If it could, a wall
+	-- run would happily leap the seam nodes across a doorway and seal it, which
+	-- is the one thing that invents connectivity. So a foreign stretch longer
+	-- than `maxGap` ends the run: a speck is ignored, a real stretch is a
+	-- boundary of its own.
+	local function fitAndPush(idx: {number}, T: string)
+		if #idx < 1 then return end
+		local cen, dir = fitLine(pts, idx)
+		segs[#segs + 1] = { idx = idx, cen = cen, dir = dir, class = T }
+	end
+
+	local T = cls[1]
 	local cur = { 1 }
+	local gapAt: number? = nil
+
 	for i = 2, n do
-		-- A RUN IS ONE CLASS OR IT IS ANOTHER, NEVER A BLEND. DESIGN.md requires
-		-- this because the classes are offset by different amounts: a segment
-		-- spanning a wall and a ledge has no single correct push and would have
-		-- to compromise into either a wall that is not stood off from or a ledge
-		-- that is eroded. Break the run and fit the two halves separately.
-		if cls[i] ~= cls[cur[1]] then
-			local ce0, de0 = fitLine(pts, cur)
-			segs[#segs + 1] = { idx = cur, cen = ce0, dir = de0, class = cls[cur[1]] }
-			cur = { i }
+		if cls[i] ~= T then
+			-- foreign node: ignore it, unless the stretch has become real
+			gapAt = gapAt or i
+			if len(sub(pts[i], pts[gapAt])) > c.maxGap then
+				fitAndPush(cur, T)
+				T = cls[gapAt]
+				cur = {}
+				for k = gapAt, i do
+					if cls[k] == T then cur[#cur + 1] = k end
+				end
+				if #cur == 0 then cur = { i }; T = cls[i] end
+				gapAt = nil
+			end
 			continue
 		end
-		-- REVERSAL ENDS A RUN, and the residual test cannot see it.
-		--
-		-- DESIGN.md makes this point about step 8 -- "an abs test calls a
-		-- 180-degree reversal collinear" -- but step 4 has the same blindness and
-		-- it bites harder. Round the end of a strip narrower than fitTol and the
-		-- walk comes back down the other side; every returning cell is within
-		-- tolerance of the line fitted to the side it just left, so the fit never
-		-- fails, the run swallows the entire ring, and a 35x2 stair step comes
-		-- out as one or two segments instead of a rectangle. That is 36 of this
-		-- map's parts.
-		--
-		-- Travel direction is the thing that actually changed, so test it. A
-		-- corner turns; only the far end of a thin strip reverses.
+		gapAt = nil
+
+		-- A reversal still ends a run, and the residual cannot see it: round the
+		-- end of a strip narrower than fitTol and every returning node is within
+		-- tolerance of the line fitted to the side just left.
 		local reversed = false
 		if #cur >= 2 then
-			local travel = sub(pts[i], pts[i - 1])
+			local travel = sub(pts[i], pts[cur[#cur]])
 			local run = sub(pts[cur[#cur]], pts[cur[1]])
 			if dot(travel, run) < 0 then reversed = true end
 		end
+
 		local trial = table.clone(cur)
 		trial[#trial + 1] = i
 		local cen, dir = fitLine(pts, trial)
 		-- MAXIMUM residual, never the average: an average lets a shallow corner
 		-- hide inside a long run, which is precisely the corner worth keeping.
-		if reversed or maxResidual(pts, trial, cen, dir) > c.fitTol then
-			-- Close the run and start the next one AT this point, so the two
-			-- segments share it.
-			local ce, de = fitLine(pts, cur)
-			segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
-			cur = { i - 1, i }
+		local fails = reversed or maxResidual(pts, trial, cen, dir) > c.fitTol
+
+		if fails then
+			-- A BREAK MUST EARN ITSELF. Ending a run here only makes sense if what
+			-- follows is actually a different edge: long enough to be one, and
+			-- turning by enough to be worth a corner. Otherwise the break yields a
+			-- two-node stub whose line is near parallel to its neighbour, which is
+			-- exactly what makes the corner intersection unstable. When it has not
+			-- earned itself, carry on and accept the residual.
+			local ok = true
+			if #cur >= 2 then
+				local ccen, cdir = fitLine(pts, cur)
+				-- how far does the same node type continue past here?
+				local last = i
+				for k = i + 1, n do
+					if cls[k] == T then last = k else break end
+				end
+				local newLen = len(sub(pts[last], pts[i - 1 >= 1 and i - 1 or i]))
+				local turn = math.deg(math.acos(math.clamp(dot(cdir, dir), -1, 1)))
+				if not reversed and (newLen < c.minSegLen or turn < c.collinearDeg) then
+					ok = false
+				end
+			end
+			if ok then
+				fitAndPush(cur, T)
+				cur = { cur[#cur], i }
+			else
+				cur = trial
+			end
 		else
 			cur = trial
 		end
 	end
-	local ce, de = fitLine(pts, cur)
-	segs[#segs + 1] = { idx = cur, cen = ce, dir = de, class = cls[cur[1]] }
+	fitAndPush(cur, T)
 	return segs
 end
 
@@ -396,7 +405,7 @@ end
 local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	local cosLim = math.cos(math.rad(c.collinearDeg))
 
-	local function refit(a: any, b: any): any?
+	local function refit(a: any, b: any, force: boolean?): any?
 		-- never across a class change: the merged run would need one push for
 		-- what is wall and another for what is ledge
 		if a.class ~= b.class then return nil end
@@ -411,7 +420,12 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 			if not seen[i] then idx[#idx + 1] = i; seen[i] = true end
 		end
 		local cen, dir = fitLine(pts, idx)
-		if maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
+		-- A merge demanded because a run is too short to be an edge, or because
+		-- the turn between two runs is not a real corner, happens whether or not
+		-- the combined residual is inside fitTol. The alternative is keeping a
+		-- stub that no downstream stage can use: its line is near parallel to its
+		-- neighbour's, so the corner between them is unstable by construction.
+		if not force and maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
 		return { idx = idx, cen = cen, dir = dir, class = a.class }
 	end
 
@@ -451,7 +465,7 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 			local tiny = spanLength(pts, a.idx) < c.minSegLen
 				or spanLength(pts, b.idx) < c.minSegLen
 			if nearly or tiny then
-				local m = refit(a, b)
+				local m = refit(a, b, true)
 				if m then
 					segs[k] = m
 					table.remove(segs, (k % #segs) + 1)
@@ -600,7 +614,6 @@ local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
 			stats[k] += 1
 		end
 		if #pts < 3 then continue end
-		despeckle(cls, c.speckle)
 
 		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
 		-- and the old implementation hit it on 165 of 169 holes: the two long
