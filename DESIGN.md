@@ -1,272 +1,254 @@
-# Boundary extraction from the surfel grid
+# Boundary extraction from part-aligned local grids
 
 ## What the problem actually is
 
-It is narrower than it was, and being precise about that is what makes the
-solution small.
+Staircasing is a **disagreement between the sampling grid and the geometry**. Fill
+in squares to record where a rotated wall is, and the record comes out as a
+jagged run of squares. The wall is straight; the record is not. Everything
+downstream reads the record.
 
-The floor stage raycasts **down** onto the real part for every cell, so heights
-are exact. Ramps come out smooth and stair risers stay crisp. **Vertical
-staircasing does not exist in this pipeline.**
+There are exactly two cures, and this pipeline uses both, in this order:
 
-What is left is the **XZ outline**. Put a rotated rectangle on the floor and the
-walkable cells form a jagged staircase around its edge, because cells are
-axis-aligned and the wall is not. That jaggedness is what inflates polygon
-counts and produces junk portals.
+1. **Turn the grid so it agrees with the geometry.** Then nothing is lost and
+   there is nothing to recover.
+2. **Where the grid cannot agree with everything at once, fit the line back.**
 
-The whole fix is: turn the jagged cell outline into clean straight lines,
-**without ever asking a Part anything.** Every step below reads only the surfel
-grid.
+An earlier version of this document described only the second. It assumed one
+world-aligned raster over the whole map — `FloorData` and its `"x:z"` index —
+so *every* rotated part staircased and the fit was load-bearing everywhere. Every
+stage was a fit, every fit had a tolerance, and the tolerances fought each other.
 
-**Input:** `FloorData` — surfels carrying position, normal, slope, clearance,
-and the `"x:z"` index.
+Turning the grid first is what makes the fit cheap. On a part-aligned grid a
+part's own rim already lies along whole lattice lines and fits with **zero
+residual**. What is left for the fit is the genuinely hard case: some *other*
+part's footprint crossing this one's lattice at an angle. Same method, a fraction
+of the edges.
+
+**Chain:** `SVO → Floor → LocalGrid → Boundary`.
+**Input to this stage:** `LocalGrid`'s per-part grids — **not** `FloorData`.
+`Floor` still runs underneath, because `LocalGrid` is built from its surfels and
+non-block parts reuse them, but the boundary stage never reads it.
 
 ## The pipeline
 
-### 1. Separate into layers by connectivity **and** 2D injectivity
+### 1. Turn the grid — `LocalGrid`
 
-Two adjacent cells belong to the same layer when their height difference is
-under the step tolerance. Label connected components over that relation.
+Each **Block** part is sampled on its own local axes, using the full frame
+including tilt, so a rotated slab is sampled square on its own incline. Its edges
+fall on whole cell lines of its own grid.
 
-Do not slice by height bands. A balcony over a courtyard would put both in the
-same slice and corrupt everything downstream.
+**Unions, MeshParts and wedges have no meaningful surface axes**, so they get a
+world-aligned fallback grid built from the global surfels. Those are the only
+places where a part's *own* rim can still staircase, and they are where the
+remaining roughness on SmallMap lives.
 
-**Connectivity alone is not enough, and the reason is not exotic.** This document
-used to claim a balcony over a courtyard was safe because the two are separate
-components. That holds only while they are *disconnected*. Ramp them together —
-the ordinary case, and the case this pipeline exists for — and they are one
-component, which then gets flattened into one 2D raster where both floors
-compete for the same `"x:z"` key. The loser is silently dropped and every stage
-downstream reads a floor plan that is part ground and part balcony.
+This also dissolves a problem the world-raster version needed a whole stage for.
+One shared raster flattens a balcony and the courtyard beneath it onto the same
+`"x:z"` key, so the old step 1 had to grow layers under a 2D-injectivity
+constraint to stop one silently overwriting the other. Per-part grids never mix
+two parts' surfaces in one index, so **that stage is gone rather than ported.**
 
-Measured on SmallMap before the fix: **7038 of 39407 cells in the largest layer
-held two or more heights** — 17.9%, all of them more than 5 studs apart, 6243
-more than 10 apart, worst pair 36.5 studs. The visible result was one
-39407-cell layer whose outer ring was an 8-vertex quad the size of the map
-footprint.
+A cell that would have been floor but was killed is kept as a `DeadCell` *with
+the instance that killed it*. The boundary stage does not use that attribution —
+see "never ask a Part anything" below — but it is the correct place to record it
+and clearance volumes will want it.
 
-So a cell may join a layer only if it is adjacent within the step tolerance
-**and** the layer does not already occupy that `x:z` at an incompatible height.
-A refused cell is not discarded — it seeds the next layer, which is exactly the
-balcony peeling off the courtyard. Every layer is now injective on `x:z` by
-construction, which is the precondition steps 2–8 always silently assumed.
+### 2. Trace the contour
 
-Where a **ClipRamp** covers a cell it *is* the walkable surface and the steps
-beneath it are not; the risers are dropped. Keeping both makes every step its
-own micro-layer.
+Walk the outline of a grid's live cell mask to get a closed loop of boundary
+cells, in the grid's own lattice.
 
-Everything from here runs per component.
+Chain boundary **edges** rather than walking boundary cells: the boundary of a
+set of cells is a closed loop by construction, so there is no open end to chase
+and no tolerance involved. The ordered cells the fit needs fall out of the edge
+order.
 
-The tolerance must **exceed the rise across one cell on the steepest walkable
-slope**: tan(65°) = 2.14, so the default is 2.2. Anything lower shatters every
-steep ramp into one layer per cell.
+Trace from where **cells** end, never from SVO solid voxels — the octree is
+deliberately conservative and would inflate the outline by up to a leaf.
 
-### 2. Euclidean distance transform
+**A cliff inside a fallback grid still ends the floor.** A world-aligned grid can
+hold two surfaces at once (a mesh with a ledge), so membership alone is not the
+test: stop at a neighbour that is missing **or more than `stepTol` away in
+height**. A block grid is a single plane and never needs this.
 
-Every walkable cell gets `D`, the distance to the nearest non-walkable cell.
-Middle of a room, large. Hugging a wall, 1.
+**Chaining at a junction is not a free choice.** A cliff between two cells that
+are both in the mask emits an edge from *each* side, on the same lattice edge in
+opposite directions — the upper rim and the lower rim are two different
+boundaries that coincide in plan. The outline therefore contains zero-width
+slits whose ends are vertices with four edges leaving them. Taking whichever
+candidate comes first there splices one rim onto the other and drops degenerate
+slivers out of the walk, which then fail segmentation and get drawn as junk.
+Use the standard face traversal of an embedded planar graph: **arriving along an
+edge, leave on the next edge clockwise from it.** With the interior kept on the
+left, that walks each rim whole and turns a slit around at its tip.
 
-It must be **true Euclidean**, not 4- or 8-neighbour stepping — those give a
-diamond or a square kernel, so the offset derived from them comes out wrong on
-the diagonals, which is exactly where the rotated walls are.
+### 3. Greedy line fit — where the remaining staircase dies
 
-`D` does triple duty: thickness map, erosion test, and the driver of the
-narrow-corridor handling in step 6.
-
-### 3. Trace the contour
-
-Walk the outline of the component's cells to get a closed loop of boundary
-cells. Trace from **where surfels end**, never from SVO solid voxels — the
-octree is deliberately over-conservative and would inflate the boundary by up to
-a leaf.
-
-This captures walls and cliff edges identically. A cell next to a wall and a
-cell at a rooftop edge are both just "floor stops here". One mechanism, no
-special cases.
-
-**A cliff inside a layer still ends the floor.** Membership is not the test. A
-layer is connected in 3D but its 2D projection need not be: a ramp climbing
-alongside the floor it departed from is one layer, passes the injectivity test,
-and still had cells 1.7 studs apart horizontally sitting 15 studs apart
-vertically. The raster read that drop as walkable ground and ran polygons
-across it. Floor stops at a neighbour that is missing **or a cliff away**.
-
-*Implementation note:* boundary **edges** are chained rather than boundary cells
-walked, because the boundary of a set of cells is a closed loop by construction —
-no open end to chase, no tolerance involved. The ordered cells the fit needs
-fall out of the edge order.
-
-### 4. Greedy line fit
-
-**Here is where the staircase dies.**
-
-Walk the loop maintaining a best-fit line through the cells accepted so far.
-After each new cell, measure the **maximum perpendicular distance** from any
-accepted cell centre to that line. While it stays under ~1 stud, keep extending.
-When it exceeds, close the segment and start fresh from that cell.
-
-Three details that matter:
+Walk the loop maintaining a best-fit line through the boundary **cell centres**
+accepted so far. After each new cell, measure the **maximum** perpendicular
+distance from any accepted centre to that line. While it stays under `fitTol`
+(one cell), keep extending. When it exceeds, close the segment and start fresh
+from that cell.
 
 - **Maximum, not average.** An average lets a shallow corner hide inside a long
   run.
-- **Total least squares** (PCA on the cell centres), not ordinary least squares —
-  edges can run near-vertical in XZ and OLS blows up there.
-- **Include the wall-hugging cells in the fit.** They define where the wall is.
-  Offsetting comes later.
-
-A rotated rectangle: the staircase cells all sit within a stud of one straight
-line at the true angle, so they collapse into a single segment. The fit finds
-the angle without ever being told it.
+- **Total least squares** (PCA on the centres), not ordinary least squares — a
+  run can be near-vertical in the grid's frame, where OLS blows up.
+- **Orient the fitted direction along the run's own travel.** A principal axis
+  has no sign, and everything downstream reads the sign as meaning something: a
+  flipped segment gets its "outward" normal pointing into the floor, and step 5
+  then biases the wrong way.
 
 **Corners are where the fit fails.** They are a byproduct, not a prerequisite.
-This is the piece that killed every previous attempt — corner detection was
-being solved separately against real geometry, and it inherited every failure
-mode of face interpretation.
+Corner detection against real geometry is what killed every earlier attempt.
+
+### 4. A reversal ends a run, and the residual cannot see it
+
+Round the end of a strip narrower than `fitTol` and the walk comes back down the
+other side. Every returning cell is within tolerance of the line fitted to the
+side it just left, so **the fit never fails and the run swallows the whole
+ring**. Test the travel direction as well: a corner turns, only the far end of a
+thin strip reverses.
+
+This is not a corner case. SmallMap's staircases are built from individual
+`35 × 2` cell step parts — 36 of them, 3.6% of every walkable cell on the map —
+and without this test all 36 collapsed and were dropped.
+
+The same guard belongs on the step 8 merge, where the residual test alone would
+otherwise weld the two sides of a thin strip together.
 
 ### 5. Bias the fit inward
 
-After fitting, translate each line inward until no accepted cell centre lies
-outward of it.
+Translate each line inward until no accepted cell centre lies outward of it.
+Without this a fit can sit outward of the cells it was fitted to and hand back
+ground that is not walkable, so the safety guarantee becomes probabilistic. With
+it, it is exact.
 
-Without this a fit can sit outward of the true wall and eat into the clearance
-margin, so the safety guarantee becomes probabilistic. With it, it is exact.
+Together with fitting to cell **centres**, this is why the polygons sit inside
+the walkable cells rather than on the part's true face — measured at ~0.96 studs
+inside on average. That is erosion, which is the safe direction.
 
-### 6. Offset inward, graded — **walls only**
+### 6. When the fit cannot resolve a ring
 
-**A dropoff is not offset at all.** The offset exists so an agent does not clip
-a wall or snag on a corner. A cliff edge presents neither, and walking the lip
-of a ledge is legitimate. Standing off from every ledge as though it were
-masonry removed 12.4% of SmallMap's cells, and removed them from exactly the
-places worth keeping — balcony rims, platform edges, stair heads — where the
-ground is already narrowest.
+`fitTol` is one cell because anything the mask can express as straight *is*
+straight. The consequence is that **a strip two cells wide can never be
+segmented**: its cell centres form a rectangle one cell deep, and a one-cell-deep
+rectangle is within tolerance of a line. That is the tolerance meaning what it
+says, not a bug.
 
-Boundary edges are classified from the surfel field alone, no Part consulted: a
-**wall** is a neighbouring column whose surface stands *above* us, a **dropoff**
-is one whose surface lies *below*, and open air is a dropoff too. The ambiguous
-case falls to wall, because over-eroding is safe and under-eroding is not.
+Discarding such a ring is the one operation here that can make real ground
+disappear, so it never happens silently. Two fallbacks, in order:
 
-A run is wall or dropoff and never a blend — a mixed segment has no single
-correct push — so the greedy fit breaks on the class change and merging refuses
-to cross one. The classification is despeckled first: it is per cell and reads a
-neighbouring column, so it picks up grit, and each speck forces a break that
-merging can then never undo.
-
-Push each **wall** line inward along its normal by `clamp(maxD − margin, 0, r)`,
-where `r` is the standard agent radius (~1.5).
-
-`maxD` is the local **thickness of the ground behind the line**, and it must be
-measured by marching inward. Reading `D` at the boundary cells themselves is
-worthless: a boundary cell is 4-adjacent to a non-walkable cell by construction,
-so its `D` is always exactly 1, which pins the push at `clamp(1 − margin, 0, r)`
-forever and makes the grading below a constant.
-
-Grading matters. A hard "skip the offset if `maxD < r`" creates a discontinuity,
-so two adjacent polygons straddling the threshold get boundaries offset by 1.5
-and by 0 and no longer share clean edges. Grading is continuous, and narrow
-corridors automatically keep their walkable area instead of vanishing.
-
-Two guards:
-
-- **Miter limit.** Acute corners make offset lines intersect arbitrarily far out —
-  the classic spike. Past a threshold, bevel instead.
-- **Never dilate-then-erode.** Closing would bridge any wall thinner than the
-  kernel and weld two rooms together, which is the through-wall portal bug
-  manufactured on purpose. Erosion alone can only remove walkable cells, so it
-  can never invent connectivity. **That is the safety property the whole thing
-  rests on.**
+- **If the ring's cells are exactly the border of their own bounding box, emit
+  that box** — four vertices, exact. This reads cell indices only, so it is as
+  valid for a Union as for a Block.
+- **Otherwise keep the raw lattice outline.** Jagged, but present. An unfitted
+  *outer* ring stands as it is, since cell centres already lie inside the
+  walkable cells. An unfitted *hole* is pushed out by half a cell, because its
+  centres sit half a cell into the obstacle and the hole would otherwise come out
+  too small — an obstacle slightly too big is safe, one too small is not.
 
 ### 7. Corners from intersections
 
-Intersect each adjacent pair of **offset** lines. That is the corner position —
-sub-cell accurate, sharper than anything the raster could give.
+Intersect each adjacent pair of lines. Sub-cell accurate, sharper than the
+lattice could give.
 
-This is also why offsetting lines beats eroding cells up front. Eroding cells
-first bevels every convex corner into a small arc, which the segmenter then
-reads as two or three short segments instead of one clean corner. More polygons,
-which is the opposite of the goal.
+**Miter limit.** An acute corner throws the intersection arbitrarily far out —
+the classic spike. Past `miterLimit` from the corner it replaces, bevel across
+instead. Near-parallel lines have no usable crossing; fall back to the foot of
+the anchor rather than inventing one.
 
-### 8. Clean up
+### 8. Clean up, all of it before any corner is intersected
 
 - **Merge the loop seam.** Greedy segmentation is order-dependent and the start
   point on a closed loop is arbitrary, so there is a spurious corner wherever the
   walk began. Test the first and last segments for collinearity and merge.
-- **Minimum segment length + near-collinear merge**, for curved geometry that
-  would otherwise shatter into dozens of tiny pieces.
-- Watch the interaction: very short segments make adjacent offset lines nearly
-  parallel, so their intersection is numerically unstable. **Merge before
-  intersecting.**
+- **Absorb short and near-collinear runs.** This is also what handles a flight
+  built from *separate* parts: nine stacked blocks with flush ends make one
+  straight edge crossed by eight seams, each seam putting a one-cell jog in the
+  mask that closes a run. Without the merge, eight spurious corners along a
+  straight line.
+- **Signed, never absolute.** An absolute test calls a 180° reversal "collinear",
+  and the two long sides of a thin ring are exactly that.
+- Short runs are what make a corner intersection unstable, which is why all of
+  this runs **before** step 7.
 
-### 9. Severance check
+## The rule this module obeys: never ask a Part anything
 
-Union-find over surfel adjacency, before and after offsetting. Any component
-that gets cut off is the signal that the offset just severed the map. Mandatory,
-not optional — it is the only detector for that failure.
+No CFrames, no face planes, no sizes, no raycasts, no overlap queries. The
+boundary stage reads cell centres and nothing else. The only contact with real
+geometry in the whole chain is the raycasting `Floor` and `LocalGrid` already
+paid for, and a raycast does not care what it hit.
 
-Report it; never silently repair it. A severed layer is a tuning failure and has
-to be visible as one.
+This was tested against the alternative and the alternative was rejected. A
+version of this stage took its lines from the side planes of whichever part
+killed each cell — using the `DeadCell` attribution — and reconstructed corners
+by crossing those planes. On SmallMap it was *more* accurate: polygons landed on
+the true face within 0.01 studs instead of ~0.96. It was still the wrong answer:
 
-Counting the pieces of what survives cannot see a layer that did not survive at
-all: annihilation is zero pieces, and `pieces > 1` is false for zero exactly as
-it is for one. That is the worst form of the failure and it was the one case
-that passed silently, so it is reported separately.
+- A Union or a MeshPart has no readable planar face. Its bounding box is not its
+  shape, so snapping a boundary to that box claims floor where there is air.
+- **Interpenetrating parts report faces that are not surfaces.** A block half
+  buried in another block still describes four tidy planes, some of which
+  correspond to nothing.
 
-### 10. Inter-layer links
+Accuracy on a clean test map is not worth reintroducing the failure mode the
+design exists to escape.
 
-A layer is a 2.5D raster and a raster cannot express "upstairs". Step 1 is what
-makes each raster mean anything, but it also cuts the ramp free of the floor it
-climbs from, so the output is a pile of correct surfaces with no way between
-them.
+## Not implemented, and required before this output is usable
 
-The cut is recoverable exactly, because the predicate that made it undoes it:
-two cells 4-adjacent in XZ and within `stepTol` are walkable neighbours, so if
-they landed in different layers that is a layer boundary drawn through
-traversable ground — a ramp foot, a stair head, a balcony meeting its walkway.
-A drop larger than `stepTol` is **not** a link, which is what keeps cliffs
-cliffs.
+The current output is **geometry only**. It traces where floor physically ends,
+not where an agent can stand.
 
-Crossings are clustered by adjacency, so two staircases between the same pair of
-layers stay two links instead of one averaged point in the middle of neither.
+- **The graded inward offset.** Push each *wall* line inward by
+  `clamp(maxD − margin, 0, agentRadius)`, graded rather than switched so two
+  adjacent polygons straddling a threshold do not offset by different amounts and
+  stop sharing an edge. A **dropoff is not offset at all** — an agent may walk
+  the lip of a ledge, and standing off from every ledge as though it were masonry
+  removed 12.4% of SmallMap's cells, from exactly the places worth keeping. This
+  needs a wall-vs-dropoff classification, and `maxD` (local ground thickness)
+  needs a **true Euclidean** distance transform — 4- or 8-neighbour stepping
+  gives a diamond or square kernel and comes out wrong on the diagonals, which is
+  where the rotated walls are.
+- **Severance check.** Union-find over cell adjacency, before and after
+  offsetting. Report it; never silently repair it — a severed layer is a tuning
+  failure and has to be visible as one. Annihilation (zero surviving pieces) must
+  be reported separately, because `pieces > 1` is false for zero exactly as it is
+  for one.
+- **Inter-part links.** Regions are per part and not merged or connected, so the
+  output is a pile of correct surfaces with no way between them.
 
-## Why this survives real maps
-
-The only geometry contact in the entire chain is the raycast that built the
-surfels. Raycasts do not care whether they hit a Block, a Union, a MeshPart, or
-four parts interpenetrating. Everything downstream is arithmetic on a grid.
-
-The old approach needed a readable planar face with a usable CFrame — which
-unions and meshes do not have, and which interpenetrating parts corrupt. That is
-why it gave us hell, and why this does not.
+**Never dilate-then-erode.** Closing would bridge any wall thinner than the
+kernel and weld two rooms together — the through-wall portal bug, manufactured on
+purpose. Erosion alone can remove walkable ground but can never invent
+connectivity. **That is the safety property the whole thing rests on.**
 
 ## What it costs
 
-Effectively nothing. Zero raycasts, zero physics queries — a handful of
-arithmetic ops per cell, against the two raycasts per cell the floor stage
-already pays. The expensive stage is unchanged.
+The boundary stage is arithmetic on cell centres: **0.05 s** for SmallMap's 87
+parts and 50,674 cells, against ~2.5 s for `LocalGrid` and its raycasts. The
+expensive stage is the sampling, and it is unchanged.
 
 ## Development workflow
 
-Serialize the surfel field once, then iterate boundary code against the cached
-snapshot. Seconds per run, not 25 minutes.
+Serialize the local grids once and iterate boundary code against the cached
+snapshot. **Measure in Studio; do not reason from reading the code.** Every
+defect found in this stage was found by running it and dumping cell grids, and
+two confident hypotheses that "explained" the symptoms were wrong.
 
 ## Known limits, stated rather than hidden
 
-- Two heights in one cell key is now handled by the injectivity rule in step 1.
-  It was listed here as a spiral-ramp case that "does not arise on the current
-  test scene"; it arose, on 17.9% of SmallMap's largest layer.
-- **Polygon count is up, not down, since dropoff classification landed**:
-  324 → 491 segments on SmallMap, bevels 18 → 140. Breaking a run at every
-  wall/dropoff transition fragments the outline, and the bevels are the miter
-  limit correctly handling real notches where a wall line pushed 1.5 meets a
-  ledge line pushed 0. Honest geometry, but more of it than before.
-- **Small regions stay isolated**: 22 regions collapse to 17 islands via links.
-  The remainder are crates and small platforms that likely need *jump* links,
-  not walk links. Connectivity is never invented to improve that number.
-- The distance transform still measures thickness **across** a same-layer cliff,
-  so the offset there over-estimates available ground and pushes further than it
-  needs to. Over-pushing is erosion, which is safe, so it is left for now.
-- A staircase with **no ClipRamp over it** still fragments into micro-layers and
-  draws picket-fence rings. On SmallMap the stairs near (81, 105) have none.
-- The offset is measured against a **standard agent radius**. Ground narrower
-  than that is preserved (graded offset, not a width floor), but the boundary it
-  produces is an agent-radius-informed one, and a very different body may want a
-  different bake.
+- **Fallback grids staircase, and cannot be fixed by turning the grid.** On
+  SmallMap, of 71 boundary edges under 1.5 studs, the great majority are on the
+  two Union hosts.
+- **A fallback grid's index is keyed on world `x:z`, so two surfaces of the same
+  Union at the same `x:z` overwrite each other** and one is silently lost. It
+  does not arise on SmallMap — 0 collisions across both fallback grids — but the
+  previous version of this document dismissed a case as "does not arise on the
+  current test scene" and it then arose on 17.9% of the largest layer, so it is
+  written down rather than assumed away.
+- **Polygons sit ~0.96 studs inside the true face** (min 0.70, max 16.3 where a
+  mask covers only part of its face). Erosion, therefore safe, but it is a real
+  accuracy cost of fitting to cell centres.
+- A part whose mask produces no ring at all is dropped. Currently 1 grid and 1
+  cell of 50,674 on SmallMap.
