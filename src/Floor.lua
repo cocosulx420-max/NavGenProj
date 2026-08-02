@@ -204,6 +204,53 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	return { surfels = surfels, index = index, config = c }
 end
 
+-- Debug viz: one neon tile per surfel, at the exact height the raycast found.
+--
+-- This is the raster every later stage actually reads, so it is the only place
+-- a missing cell is visible as a missing cell rather than as some downstream
+-- artefact. The leaf-clipped down-ray showed up here as a diagonal line of gaps
+-- along every wall base long before it was obvious in the polygons.
+--
+-- `opts.bounds = {minX, maxX, minZ, maxZ}` scopes it: the whole of SmallMap is
+-- ~49k tiles and Studio will not thank you for that. `opts.colorOf(surfel, key)`
+-- overrides the colour, which is what colours the field by layer.
+-- Unwalkable surfels (clearance below minClearance) are drawn dark red and low,
+-- so a hole in the walkable set reads differently from no surfel at all.
+function Floor.visualize(data: any, opts: any?, parent: Instance?)
+	local o = opts or {}
+	local root = parent or workspace
+	local old = root:FindFirstChild("NavGen_Floor")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder")
+	folder.Name = "NavGen_Floor"
+	folder.Parent = root
+
+	local b = o.bounds
+	local minClear = (data.config and data.config.minClearance) or 1.5
+	local n = 0
+	for key, bucket in pairs(data.index) do
+		local sx, sz = key:match("(-?%d+):(-?%d+)")
+		local x, z = tonumber(sx) + 0.5, tonumber(sz) + 0.5
+		if not b or (x >= b[1] and x <= b[2] and z >= b[3] and z <= b[4]) then
+			for _, s in ipairs(bucket) do
+				local walkable = s.clearance >= minClear
+				local p = Instance.new("Part")
+				p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+				p.Material = Enum.Material.Neon
+				p.Size = Vector3.new(0.9, 0.06, 0.9)
+				p.Position = Vector3.new(x, s.pos.Y + (walkable and 0.08 or 0.02), z)
+				p.Color = (o.colorOf and o.colorOf(s, key))
+					or (walkable and Color3.fromRGB(120, 235, 140) or Color3.fromRGB(120, 30, 30))
+				p.Transparency = walkable and 0 or 0.35
+				p.Parent = folder
+				n += 1
+			end
+		end
+	end
+	folder:SetAttribute("Tiles", n)
+	return folder
+end
+
 -- Convenience one-call bake: gather parts, build SVO, extract floor.
 -- Returns floorData, tree, parts.
 function Floor.build(cfg: Config?)
