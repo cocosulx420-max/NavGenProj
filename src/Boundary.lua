@@ -239,12 +239,22 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 	-- the face's real half-extent, so the outermost lattice line is mapped to the
 	-- part's own extent instead. This is what LocalGrid keeps center/uExt/vExt
 	-- for, and it is the same idea the killer snapping below generalises.
-	local nu = isBlock and math.max(1, math.floor(2 * g.uExt / step + 1e-6)) or 0
-	local nv = isBlock and math.max(1, math.floor(2 * g.vExt / step + 1e-6)) or 0
-	local function toFace(iu: number, iv: number): (number, number)
-		local uc = (iu <= 0) and 0 or (iu >= nu and 2 * g.uExt or iu * step)
-		local vc = (iv <= 0) and 0 or (iv >= nv and 2 * g.vExt or iv * step)
-		return uc, vc
+	local toFace
+	if isBlock then
+		local nu = math.max(1, math.floor(2 * g.uExt / step + 1e-6))
+		local nv = math.max(1, math.floor(2 * g.vExt / step + 1e-6))
+		toFace = function(iu: number, iv: number): (number, number)
+			local uc = (iu <= 0) and 0 or (iu >= nu and 2 * g.uExt or iu * step)
+			local vc = (iv <= 0) and 0 or (iv >= nv and 2 * g.vExt or iv * step)
+			return uc, vc
+		end
+	else
+		-- A fallback grid has no face rectangle to be exact about: its indices are
+		-- world lattice lines, they run negative, and there is no extent to clamp
+		-- the outermost one to. Straight through.
+		toFace = function(iu: number, iv: number): (number, number)
+			return iu * step, iv * step
+		end
 	end
 
 	local toWorld
