@@ -74,6 +74,7 @@ local DEFAULT = {
 	miterLimit = 3.0,
 	maxGap = 3.0,
 	mergeNeedsFit = false,
+	insetAll = true,
 }
 
 local function merged(cfg): any
@@ -744,7 +745,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			--
 			-- So a wall line is moved in until no node of its own run lies outside
 			-- it. Erosion, and the safe direction.
-			if sg.class == WALL then
+			if sg.class == WALL or c.insetAll then
 				local inner = math.huge
 				for _, i in ipairs(sg.idx) do
 					local d = dot(pts[i], nrm)
