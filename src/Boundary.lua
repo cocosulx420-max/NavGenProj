@@ -319,32 +319,25 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string})
 		local fails = reversed or maxResidual(pts, trial, cen, dir) > c.fitTol
 
 		if fails then
-			-- A BREAK MUST EARN ITSELF. Ending a run here only makes sense if what
-			-- follows is actually a different edge: long enough to be one, and
-			-- turning by enough to be worth a corner. Otherwise the break yields a
-			-- two-node stub whose line is near parallel to its neighbour, which is
-			-- exactly what makes the corner intersection unstable. When it has not
-			-- earned itself, carry on and accept the residual.
-			local ok = true
-			if #cur >= 2 then
-				local ccen, cdir = fitLine(pts, cur)
-				-- how far does the same node type continue past here?
-				local last = i
-				for k = i + 1, n do
-					if cls[k] == T then last = k else break end
-				end
-				local newLen = len(sub(pts[last], pts[i - 1 >= 1 and i - 1 or i]))
-				local turn = math.deg(math.acos(math.clamp(dot(cdir, dir), -1, 1)))
-				if not reversed and (newLen < c.minSegLen or turn < c.collinearDeg) then
-					ok = false
-				end
-			end
-			if ok then
-				fitAndPush(cur, T)
-				cur = { cur[#cur], i }
-			else
-				cur = trial
-			end
+			-- A BREAK MUST EARN ITSELF -- BUT THE FIT COMES FIRST.
+			--
+			-- The residual is the promise this stage makes: a line follows the
+			-- nodes it claims, to within fitTol. So a failure always breaks. The
+			-- earlier version treated "don't make a pointless corner" as able to
+			-- override that, and carried on accepting nodes however far off the
+			-- line they fell. Worse, it measured the turn between the CURRENT fit
+			-- and the trial fit -- adding one node to a long run barely rotates
+			-- it, so the turn was always about zero, always under the threshold,
+			-- and the break was refused every time. Runs swallowed whole rings
+			-- and lines were drawn straight across surfaces with no nodes near
+			-- them: worst case, a line 51 studs from a node it claimed.
+			--
+			-- Not making a pointless corner is step 8's job, where two finished
+			-- runs can be compared properly and merged only if the merged line
+			-- still fits. It cannot be done by refusing to break, because by then
+			-- there is no second run to compare against.
+			fitAndPush(cur, T)
+			cur = { cur[#cur], i }
 		else
 			cur = trial
 		end
