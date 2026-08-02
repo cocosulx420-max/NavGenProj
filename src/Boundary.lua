@@ -367,6 +367,30 @@ local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[st
 		end
 	end
 
+	-- CHAINING AT A JUNCTION, which is not the free choice it looks like.
+	--
+	-- A missing neighbour emits ONE edge. A cliff between two cells that are both
+	-- in the layer emits TWO, one from each side, lying on the same lattice edge
+	-- in opposite directions -- and that is right, because the roof's rim and the
+	-- ground's rim really are two different boundaries that happen to coincide in
+	-- plan. The layer's outline therefore has zero-width SLITS in it, and a slit's
+	-- ends are lattice vertices with four boundary edges leaving them.
+	--
+	-- Taking whichever candidate came first there splices the roof's rim onto the
+	-- ground's rim and drops a degenerate two-edge sliver out of the walk. Those
+	-- slivers cannot be segmented, so they fell to the raw-ring fallback and were
+	-- drawn as obstacle hexagons expanded by the agent radius: 107 of SmallMap's
+	-- 107 "holes", strung in lines along every roof edge in the map.
+	--
+	-- The rule that makes it deterministic is the standard face traversal of an
+	-- embedded planar graph: arriving along an edge, leave on the next edge
+	-- CLOCKWISE from the one you came in on. With the interior kept on the left
+	-- by `corners`, that walks each rim as a whole and turns a slit around at its
+	-- tip instead of cutting across it.
+	local function angle(s: any): number
+		return math.atan2(s.b[2] - s.a[2], s.b[1] - s.a[1])
+	end
+	local TAU = math.pi * 2
 	local used: {[any]: boolean} = {}
 	local loops: {{any}} = {}
 	for _, s0 in ipairs(segs) do
@@ -376,10 +400,19 @@ local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[st
 				used[cur] = true
 				loop[#loop + 1] = cur
 				local cands = byStart[cur.b[1] .. "," .. cur.b[2]]
-				local nxt = nil
+				local nxt, bestTurn = nil, math.huge
 				if cands then
+					-- the direction we would leave on to go straight back
+					local back = angle(cur) + math.pi
 					for _, s in ipairs(cands) do
-						if not used[s] then nxt = s; break end
+						if not used[s] then
+							-- clockwise sweep from `back`; going straight back is the
+							-- full turn, so it is taken only when nothing else is left,
+							-- which is exactly the tip of a slit.
+							local turn = (back - angle(s)) % TAU
+							if turn <= 1e-9 then turn = TAU end
+							if turn < bestTurn then nxt, bestTurn = s, turn end
+						end
 					end
 				end
 				cur = nxt
