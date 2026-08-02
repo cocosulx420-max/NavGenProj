@@ -111,34 +111,6 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
-	-- The same surface is now reachable from several leaves, so a column may be
-	-- probed more than once. Key on cell and height so the index holds each
-	-- surface once.
-	local seen: {[string]: boolean} = {}
-
-	-- The floor of the whole tree, not of this leaf. THIS IS THE POINT.
-	--
-	-- The down-ray used to be clipped to the leaf that spawned it (`edge + 2`),
-	-- which silently assumed the surface under a column is inside the same leaf
-	-- as whatever sits above it. At a wall it is not. The SVO is deliberately
-	-- conservative, so a wall's voxels over-cover its footprint by up to a leaf;
-	-- the ground leaf then skips that column on the empty-above guard (line
-	-- below), and the wall's own leaf casts a ray far too short to reach the
-	-- ground ten studs down. Neither leaf claims it, and the cell comes out with
-	-- no surfel at all.
-	--
-	-- That is one missing cell hugging the base of every wall and the lip of
-	-- every stair riser. Downstream they are not read as seams -- they are read
-	-- as one-cell OBSTACLES, fall to the raw-ring fallback, and get drawn as a
-	-- hexagon expanded by the agent radius. 100 of SmallMap's 102 "holes" were
-	-- this, marching in a diagonal line down every edge in the map.
-	--
-	-- Casting to the bottom of the tree can only ADD surfels, never move one:
-	-- the ray still stops at the first surface it meets. Clearance above them is
-	-- measured against real geometry a few lines down, not against the
-	-- conservative voxels, so a column that really is buried still reports
-	-- clearance 0 and is filtered where it always was.
-	local floorY = tree.center.Y - tree.half - 1
 
 	tree:forEachSolidLeaf(function(ctr: Vector3, h: number)
 		local edge = 2 * h
@@ -148,11 +120,8 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				local cx = ctr.X - h + 0.5 + i
 				local cz = ctr.Z - h + 0.5 + j
 				if tree:isSolid(Vector3.new(cx, top + 0.5, cz)) then continue end
-				local res = workspace:Raycast(Vector3.new(cx, top + 1, cz), Vector3.new(0, floorY - (top + 1), 0), rp)
+				local res = workspace:Raycast(Vector3.new(cx, top + 1, cz), Vector3.new(0, -(edge + 2), 0), rp)
 				if not res then continue end
-				local dk = cellKey(cx, cz) .. "|" .. math.floor(res.Position.Y * 4 + 0.5)
-				if seen[dk] then continue end
-				seen[dk] = true
 				local n = res.Normal
 				local slope = math.deg(math.acos(math.clamp(n:Dot(UP), -1, 1)))
 				local isClip = res.Instance.Name:find("ClipRamp") ~= nil
@@ -202,53 +171,6 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	probe:Destroy()
 
 	return { surfels = surfels, index = index, config = c }
-end
-
--- Debug viz: one neon tile per surfel, at the exact height the raycast found.
---
--- This is the raster every later stage actually reads, so it is the only place
--- a missing cell is visible as a missing cell rather than as some downstream
--- artefact. The leaf-clipped down-ray showed up here as a diagonal line of gaps
--- along every wall base long before it was obvious in the polygons.
---
--- `opts.bounds = {minX, maxX, minZ, maxZ}` scopes it: the whole of SmallMap is
--- ~49k tiles and Studio will not thank you for that. `opts.colorOf(surfel, key)`
--- overrides the colour, which is what colours the field by layer.
--- Unwalkable surfels (clearance below minClearance) are drawn dark red and low,
--- so a hole in the walkable set reads differently from no surfel at all.
-function Floor.visualize(data: any, opts: any?, parent: Instance?)
-	local o = opts or {}
-	local root = parent or workspace
-	local old = root:FindFirstChild("NavGen_Floor")
-	if old then old:Destroy() end
-	local folder = Instance.new("Folder")
-	folder.Name = "NavGen_Floor"
-	folder.Parent = root
-
-	local b = o.bounds
-	local minClear = (data.config and data.config.minClearance) or 1.5
-	local n = 0
-	for key, bucket in pairs(data.index) do
-		local sx, sz = key:match("(-?%d+):(-?%d+)")
-		local x, z = tonumber(sx) + 0.5, tonumber(sz) + 0.5
-		if not b or (x >= b[1] and x <= b[2] and z >= b[3] and z <= b[4]) then
-			for _, s in ipairs(bucket) do
-				local walkable = s.clearance >= minClear
-				local p = Instance.new("Part")
-				p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
-				p.Material = Enum.Material.Neon
-				p.Size = Vector3.new(0.9, 0.06, 0.9)
-				p.Position = Vector3.new(x, s.pos.Y + (walkable and 0.08 or 0.02), z)
-				p.Color = (o.colorOf and o.colorOf(s, key))
-					or (walkable and Color3.fromRGB(120, 235, 140) or Color3.fromRGB(120, 30, 30))
-				p.Transparency = walkable and 0 or 0.35
-				p.Parent = folder
-				n += 1
-			end
-		end
-	end
-	folder:SetAttribute("Tiles", n)
-	return folder
 end
 
 -- Convenience one-call bake: gather parts, build SVO, extract floor.

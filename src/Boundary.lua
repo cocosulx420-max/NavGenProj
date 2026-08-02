@@ -367,30 +367,6 @@ local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[st
 		end
 	end
 
-	-- CHAINING AT A JUNCTION, which is not the free choice it looks like.
-	--
-	-- A missing neighbour emits ONE edge. A cliff between two cells that are both
-	-- in the layer emits TWO, one from each side, lying on the same lattice edge
-	-- in opposite directions -- and that is right, because the roof's rim and the
-	-- ground's rim really are two different boundaries that happen to coincide in
-	-- plan. The layer's outline therefore has zero-width SLITS in it, and a slit's
-	-- ends are lattice vertices with four boundary edges leaving them.
-	--
-	-- Taking whichever candidate came first there splices the roof's rim onto the
-	-- ground's rim and drops a degenerate two-edge sliver out of the walk. Those
-	-- slivers cannot be segmented, so they fell to the raw-ring fallback and were
-	-- drawn as obstacle hexagons expanded by the agent radius: 107 of SmallMap's
-	-- 107 "holes", strung in lines along every roof edge in the map.
-	--
-	-- The rule that makes it deterministic is the standard face traversal of an
-	-- embedded planar graph: arriving along an edge, leave on the next edge
-	-- CLOCKWISE from the one you came in on. With the interior kept on the left
-	-- by `corners`, that walks each rim as a whole and turns a slit around at its
-	-- tip instead of cutting across it.
-	local function angle(s: any): number
-		return math.atan2(s.b[2] - s.a[2], s.b[1] - s.a[1])
-	end
-	local TAU = math.pi * 2
 	local used: {[any]: boolean} = {}
 	local loops: {{any}} = {}
 	for _, s0 in ipairs(segs) do
@@ -400,19 +376,10 @@ local function traceLoops(member: {[string]: boolean}, cells: {any}, cellY: {[st
 				used[cur] = true
 				loop[#loop + 1] = cur
 				local cands = byStart[cur.b[1] .. "," .. cur.b[2]]
-				local nxt, bestTurn = nil, math.huge
+				local nxt = nil
 				if cands then
-					-- the direction we would leave on to go straight back
-					local back = angle(cur) + math.pi
 					for _, s in ipairs(cands) do
-						if not used[s] then
-							-- clockwise sweep from `back`; going straight back is the
-							-- full turn, so it is taken only when nothing else is left,
-							-- which is exactly the tip of a slit.
-							local turn = (back - angle(s)) % TAU
-							if turn <= 1e-9 then turn = TAU end
-							if turn < bestTurn then nxt, bestTurn = s, turn end
-						end
+						if not used[s] then nxt = s; break end
 					end
 				end
 				cur = nxt
@@ -576,7 +543,6 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		severed = 0, severedLayers = 0, annihilated = 0, droppedCells = 0,
 		worstResidual = 0,
-		heightClamped = 0, heightUnreachable = 0,
 	}
 	local regions: {any} = {}
 
@@ -846,13 +812,8 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 		-- arbitrary height. That is what drew the vertical fences at the wall
 		-- bases: one vertex of a flat ring teleporting to whatever height cell 1
 		-- happened to sit at. Search wider, then fall back to the genuinely
-		-- nearest cell rather than the first one -- and, per `toWorld` below,
-		-- never further vertically than a walkable slope could have carried the
-		-- ring there.
-		-- Nearest cell of this layer whose height falls inside [lo, hi]. Returns
-		-- nil when the layer has no such cell anywhere, so the caller can decide
-		-- what to do rather than being handed a wrong number.
-		local function nearestCell(p: P2, lo: number, hi: number): (number?, number)
+		-- nearest cell rather than the first one.
+		local function heightAt(p: P2): number
 			local bx, bz = math.floor(p.x), math.floor(p.z)
 			for rad = 0, 8 do
 				local best, bestD = nil, math.huge
@@ -861,90 +822,25 @@ function Boundary.fromFloor(floorData: any, cfg: Config?)
 						if math.max(math.abs(dx), math.abs(dz)) == rad then
 							local k = (bx + dx) .. ":" .. (bz + dz)
 							local y = cellY[k]
-							if y and y >= lo and y <= hi then
+							if y then
 								local d = (bx + dx + 0.5 - p.x) ^ 2 + (bz + dz + 0.5 - p.z) ^ 2
 								if d < bestD then best, bestD = y, d end
 							end
 						end
 					end
 				end
-				if best then return best, bestD end
+				if best then return best end
 			end
-			local best, bestD = nil, math.huge
+			local best, bestD = cells[1].y, math.huge
 			for _, cell in ipairs(cells) do
-				if cell.y >= lo and cell.y <= hi then
-					local d = (cell.ix + 0.5 - p.x) ^ 2 + (cell.iz + 0.5 - p.z) ^ 2
-					if d < bestD then best, bestD = cell.y, d end
-				end
+				local d = (cell.ix + 0.5 - p.x) ^ 2 + (cell.iz + 0.5 - p.z) ^ 2
+				if d < bestD then best, bestD = cell.y, d end
 			end
-			return best, bestD
+			return best
 		end
-
-		-- VERTICAL CONTINUITY, and it is what killed the picket fences.
-		--
-		-- Nearest-cell-in-XZ is the right height only while the layer is single
-		-- valued near the vertex. A layer legitimately spans a whole building --
-		-- ground, stairs and roof are one connected, x:z-injective component --
-		-- so a vertex sitting on the roof's edge has ground cells 1 stud away in
-		-- XZ and 10 studs below. Nearest-in-XZ picked those, and the ring
-		-- teleported down the wall and back: on SmallMap 58 of 102 holes had two
-		-- CONSECUTIVE vertices, 2-4 studs apart on the ground, 10 studs apart in
-		-- height. Drawn, that is a fence of vertical bars down every facade.
-		--
-		-- A ring is a loop of walkable boundary, so the constraint is just the
-		-- walkable slope: over dxz studs of ground the height may move by at most
-		-- stepTol per stud, which is the same 65-degree limit layering uses. Walk
-		-- the loop from the vertex whose unconstrained answer is most trustworthy
-		-- -- the one sitting closest to a cell of its own layer -- and let each
-		-- vertex pick the nearest cell that its predecessor's height can reach.
-		--
-		-- The constraint is never allowed to FAIL a vertex: if no cell in the
-		-- layer is reachable, the unconstrained nearest is still better than
-		-- nothing, and the fallback is counted rather than hidden.
 		local function toWorld(ring: any): {Vector3}
-			local pts = ring.pts
-			local n = #pts
-			local free, freeD = {}, {}
-			for i = 1, n do
-				local y, d = nearestCell(pts[i], -math.huge, math.huge)
-				free[i], freeD[i] = y or cells[1].y, d
-			end
-			-- Seeding on the single closest vertex is not enough on its own: a
-			-- ring around a building's footprint has one vertex whose closest
-			-- cell IS the roof, at distance zero, and pinning there drags the
-			-- whole ground-level ring ten studs up. So take the height the ring
-			-- MOSTLY agrees on first -- the largest cluster of unconstrained
-			-- picks within a step of each other -- and seed at the closest
-			-- vertex holding it. One vertex can no longer outvote the loop.
-			local seed, seedD = 1, math.huge
-			local bestVotes = -1
-			for i = 1, n do
-				local votes = 0
-				for j = 1, n do
-					if math.abs(free[j] - free[i]) <= c.stepTol then votes += 1 end
-				end
-				if votes > bestVotes or (votes == bestVotes and freeD[i] < seedD) then
-					seed, seedD, bestVotes = i, freeD[i], votes
-				end
-			end
-
-			local out = table.create(n)
-			out[seed] = Vector3.new(pts[seed].x, free[seed], pts[seed].z)
-			local prevY = free[seed]
-			for step = 1, n - 1 do
-				local i = ((seed - 1 + step) % n) + 1
-				local prev = ((seed - 2 + step) % n) + 1
-				local rise = c.stepTol * math.max(1, len(sub(pts[i], pts[prev])))
-				local y = nearestCell(pts[i], prevY - rise, prevY + rise)
-				if y then
-					if y ~= free[i] then stats.heightClamped += 1 end
-				else
-					y = free[i]
-					stats.heightUnreachable += 1
-				end
-				out[i] = Vector3.new(pts[i].x, y, pts[i].z)
-				prevY = y
-			end
+			local out = {}
+			for i, p in ipairs(ring.pts) do out[i] = Vector3.new(p.x, heightAt(p), p.z) end
 			return out
 		end
 
