@@ -49,6 +49,9 @@ export type Config = {
 	-- agree to within collinearDeg are merged -- both BEFORE corners are
 	-- intersected, because short runs are what make an intersection unstable.
 	minSegLen: number?,
+	-- Two runs whose directions agree to within this are one run. Deliberately
+	-- generous: Cocosulx would rather carry fewer, straighter edges than have the
+	-- boundary kink by 14 degrees to chase a node.
 	collinearDeg: number?,
 
 	-- STEP 7. An acute corner throws two lines' intersection arbitrarily far
@@ -67,10 +70,10 @@ local DEFAULT = {
 	stepTol = 2.2,
 	fitTol = 0.5,
 	minSegLen = 1.0,
-	collinearDeg = 5,
+	collinearDeg = 20,
 	miterLimit = 3.0,
 	maxGap = 3.0,
-	mergeNeedsFit = true,
+	mergeNeedsFit = false,
 }
 
 local function merged(cfg): any
@@ -730,6 +733,28 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		for _, sg in ipairs(segs) do
 			local nrm = outwardOf(sg.dir)
 			local cval = dot(sg.cen, nrm)
+			-- A WALL LINE PULLS BACK OFF THE WALL.
+			--
+			-- Balanced is right for a ledge, where the boundary is the edge of the
+			-- floor and there is nothing to clip. It is wrong against masonry: a
+			-- line through the centroid leaves half its nodes on the far side, so
+			-- the boundary cuts into the wall -- 66 of 521 edges ran outside the
+			-- walkable cells, one of them 29% of its length. Cocosulx would rather
+			-- the boundary sat back from a wall than traced it exactly.
+			--
+			-- So a wall line is moved in until no node of its own run lies outside
+			-- it. Erosion, and the safe direction.
+			if sg.class == WALL then
+				local inner = math.huge
+				for _, i in ipairs(sg.idx) do
+					local d = dot(pts[i], nrm)
+					if d < inner then inner = d end
+				end
+				if inner < cval then
+					stats.wallsInset += 1
+					cval = inner
+				end
+			end
 			-- WORST DISTANCE FROM A LINE TO A NODE IT CLAIMS. fitTol is the
 			-- promise; anything far above it means a line is being drawn through
 			-- nodes it does not follow.
@@ -909,6 +934,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
+		wallsInset = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
