@@ -1,19 +1,4 @@
 --!strict
--- NVGN.LocalGrid — per-part, part-aligned sampling grids (approach B: surface-aligned)
---
--- The global floor grid (Floor.lua) samples on WORLD axes, so the edges of any
--- rotated part staircase against the world lattice. This stage rebuilds the
--- walkable surface as one grid PER PART, aligned to that part's own local axes,
--- so each part's edges fall on whole cell lines (no staircase on the part itself).
---
---   * Block parts  -> approach (B): sample the part's principal top face along its
---                     surface normal. Because we use the FULL local frame (incl.
---                     tilt), a rotated slab ramp is sampled square on its incline.
---   * Non-block    -> Unions / MeshParts / wedges have no meaningful surface axes,
---     (fallback)     so they reuse the world-aligned global surfels for that part.
---
--- Feeds the boundary stage (edges come from geometry; the local grid is the
--- interior fill/tessellation guide) and later polygonization.
 
 local Floor = require(script.Parent:WaitForChild("Floor"))
 
@@ -25,18 +10,9 @@ export type Cell = {
 	normal: Vector3,
 	slope: number,            -- degrees from world-up
 	clearance: number,        -- studs of vertical headroom (capped)
-	-- What is overhead, when anything is. Free here (the clearance probe
-	-- already found it) and it is the attribution clearance volumes need:
-	-- destroy the cover, delete the volume, instead of re-polygonizing.
 	cover: Instance?,
 }
 
--- A sample that would have been floor but was killed, kept WITH the instance
--- that killed it. Attribution is captured at kill time from the probe that
--- found it, so the boundary stage never re-probes the world to ask "why is
--- there nothing here?" — no second chance to hit the inside-origin trap, and
--- no misattribution. Dead cells are a selection mask and nothing else: they
--- are never used as geometry.
 export type DeadCell = {
 	ui: number, vi: number,
 	pos: Vector3,
@@ -49,10 +25,6 @@ export type Grid = {
 	origin: Vector3?,         -- face corner (world); block grids only
 	u: Vector3?, v: Vector3?, -- in-plane unit axes (world); block grids only
 	n: Vector3?,              -- surface normal (world); block grids only
-	-- The walkable face's own rectangle, kept so the boundary stage can steal
-	-- the part's RIM planes exactly. Without it a dropoff can only be measured
-	-- from the cell mask, which quantizes to the lattice and stops up to a
-	-- stud short whenever the part size is not a whole number of cells.
 	center: Vector3?,         -- centre of the walkable face (world)
 	uExt: number?, vExt: number?, -- half-extents along u and v
 	step: number,
@@ -108,11 +80,6 @@ local function avgNormal(surfels: {any}): Vector3
 	return (s.Magnitude > 1e-4) and s.Unit or Vector3.yAxis
 end
 
--- Pick a block's walkable face: the +/- principal axis closest to the actual
--- surface normal (from the surfels), NOT the axis most world-up. A thin slab
--- tilted past ~45deg has an edge axis with a higher Y-component than its real
--- face normal, so a world-up heuristic collapses the grid to a 1-wide strip.
--- Returns the surface normal, its half-extent, and the two in-plane axes.
 local function topFace(part: BasePart, surfaceN: Vector3)
 	local cf = part.CFrame
 	local sz = part.Size
@@ -135,7 +102,6 @@ local function topFace(part: BasePart, surfaceN: Vector3)
 	return n, a.ext, plane[1], plane[2]
 end
 
--- Block part: surface-aligned grid over the principal walkable face.
 local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid
 	local n, nExt, ua, va = topFace(part, avgNormal(surfels))
 	local u, uExt = ua.dir, ua.ext
@@ -172,14 +138,6 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 			if not res then continue end
 			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
-			-- Clearance. A raycast NEVER hits a part its origin is inside, so ray
-			-- logic alone cannot detect an embedded origin (wall flush on the floor,
-			-- buried overlap region, curved union — two-ray probing leaks on all of
-			-- these). Precise overlap probe first: any foreign solid crossing
-			-- [0.1, minClearance] above the surface means true headroom < minClearance
-			-- -> dead cell. Host is excluded: a Block is convex, so its own solid can
-			-- never sit above its own top face. Only a clear probe guarantees the
-			-- up-ray origin is outside every collider, making its distance exact.
 			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
 			local killer: Instance? = nil
 			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
@@ -192,9 +150,6 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 			local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
 			local clearance = upRes and upRes.Distance or c.clearCap
 			local cover: Instance? = upRes and upRes.Instance or nil
-			-- Terrain is not in `parts` (never walkable) but still blocks headroom;
-			-- overlap queries are parts-only, so probe it with a terrain-only ray
-			-- pair (down-ray catches the embedded-origin case for blobs on floors).
 			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
 			if tUp then
 				if tUp.Distance < clearance then
@@ -220,7 +175,6 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	return grid
 end
 
--- Non-block part: reuse the world-aligned global surfels for this part.
 local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 	local grid: Grid = {
 		part = part, fallback = true, step = c.step, cells = {}, index = {},
@@ -247,8 +201,6 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	filterAll.FilterType = Enum.RaycastFilterType.Include
 	filterAll.FilterDescendantsInstances = parts
 
-	-- Embedded-origin probe shared by all block grids (see clearance note in
-	-- buildBlockGrid).
 	local probe = Instance.new("Part")
 	probe.Name = "NVGN_ClearProbe"
 	probe.Size = Vector3.new(0.05, c.minClearance - 0.1, 0.05)
@@ -294,12 +246,6 @@ function LocalGrid.build(cfg: Config?)
 	return data, floorData, tree, parts
 end
 
--- Debug viz: one neon tile per cell, colored per-part, oriented to the surface
--- (block grids) so alignment is eyeball-able. Fallback parts are desaturated.
--- Traversal class (height tiers) is encoded in brightness + size — walk
--- (clearance >= 4, min standing height) full-bright 0.9-wide, crouch (>= 3)
--- dimmer 0.7-wide, crawl (>= 1.5) dim ember 0.55-wide — so real walking space
--- and crawlspace are distinguishable at a glance. Dot Name = clearance.
 function LocalGrid.visualize(data: any, parent: Instance?)
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
