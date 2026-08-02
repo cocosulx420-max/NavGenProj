@@ -227,6 +227,36 @@ cliffs.
 Crossings are clustered by adjacency, so two staircases between the same pair of
 layers stay two links instead of one averaged point in the middle of neither.
 
+### 11. Vertex heights, along a walkable slope
+
+Steps 2–8 are entirely 2D. Heights come back at the very end, one per ring
+vertex, from the nearest cell of that ring's own layer.
+
+Nearest-in-XZ alone is wrong, and visibly so. A layer legitimately spans a whole
+building — ground, stairs and roof are one connected, `x:z`-injective component —
+so a vertex sitting on a roof edge has ground cells a stud away in XZ and ten
+studs below, and picks them. On SmallMap **58 of 102 holes had two consecutive
+vertices 2–4 studs apart on the ground and 10 studs apart in height**. Drawn,
+that is a fence of vertical bars down every facade, and it is the same class of
+bug as the old `cells[1].y` fallback rather than a new one.
+
+The constraint is just the walkable slope. A ring is a loop of walkable
+boundary, so over `dxz` studs of ground the height may move by at most `stepTol`
+per stud — the same 65° limit step 1 uses. Walk the loop and let each vertex
+take the nearest cell its predecessor's height can reach.
+
+Two details:
+
+- **Seed on what the ring mostly agrees on**, not on its single closest vertex.
+  A hole ring around a building footprint has one vertex whose nearest cell *is*
+  the roof, at distance zero; pinning there drags the whole ground-level loop up
+  and leaves the drop on the edge the walk closes over. Seed on the largest
+  cluster of unconstrained picks within a step of each other.
+- **The constraint may never fail a vertex.** Where no cell of the layer is
+  reachable, the unconstrained nearest still stands and is counted in
+  `stats.heightUnreachable`. A wrong height is a drawing artefact; no height is
+  a hole in the output.
+
 ## Why this survives real maps
 
 The only geometry contact in the entire chain is the raycast that built the
