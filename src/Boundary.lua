@@ -397,7 +397,7 @@ end
 -- STEP 8 — clean up, and all of it BEFORE any corner is intersected
 --------------------------------------------------------------------------
 
-local function mergeSegments(pts: {P2}, segs: {any}, c: any)
+local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 	local cosLim = math.cos(math.rad(c.collinearDeg))
 
 	local function refit(a: any, b: any, force: boolean?): any?
@@ -464,6 +464,42 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 				if m then
 					segs[k] = m
 					table.remove(segs, (k % #segs) + 1)
+					changed = true
+					break
+				end
+			end
+		end
+	end
+	-- A STUB BETWEEN TWO RUNS THAT AGREE IS NOISE.
+	--
+	-- The pairwise merge above only ever compares a run with its immediate
+	-- neighbour, so it cannot see the case that actually looks wrong: a run of a
+	-- fraction of a stud sitting between two runs that are heading the SAME way.
+	-- There is no corner there -- the boundary just twitches and comes back.
+	-- Measured on SmallMap, 30 of 628 edges, including a 0.18-stud segment
+	-- between neighbours 3.4 degrees apart.
+	--
+	-- Cocosulx's rule: if the new line would be really short, carry on with the
+	-- line already running instead of creating it. So the stub's nodes are given
+	-- to the run before it, whose line then answers for them, and the two
+	-- neighbours become adjacent and merge normally if they should.
+	changed = true
+	while changed and #segs > 3 do
+		changed = false
+		for k = 1, #segs do
+			local prev = segs[(k - 2) % #segs + 1]
+			local cur = segs[k]
+			local nxt = segs[k % #segs + 1]
+			if prev ~= cur and nxt ~= cur and prev ~= nxt
+				and prev.class == cur.class
+				and spanLength(pts, cur.idx) < c.minSegLen
+				and dot(prev.dir, nxt.dir) >= cosLim
+			then
+				local m = refit(prev, cur, true)
+				if m then
+					segs[(k - 2) % #segs + 1] = m
+					table.remove(segs, k)
+					stats.stubsAbsorbed += 1
 					changed = true
 					break
 				end
@@ -603,7 +639,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
 		local rawSegs = segmentLoop(pts, c, cls)
-		local segs = mergeSegments(pts, rawSegs, c)
+		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
 		if c.debugPart and g.part == c.debugPart then
 			local function snap(list)
@@ -857,7 +893,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- boundary edges by class; seam edges are joins, not boundaries
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
-		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0,
+		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, stubsAbsorbed = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0, cornersTrimmed = 0,
 	}
