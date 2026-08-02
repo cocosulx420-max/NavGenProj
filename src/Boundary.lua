@@ -292,6 +292,48 @@ local function spanLength(pts: {P2}, idx: {number}): number
 	return len(sub(pts[idx[#idx]], pts[idx[1]]))
 end
 
+-- THE FALLBACK FOR A RING THE FIT CANNOT RESOLVE.
+--
+-- fitTol is one cell, deliberately: DESIGN.md's rule is that anything the mask
+-- can express as straight IS straight. The consequence is that a strip two
+-- cells wide can never be segmented, because its cell centres form a rectangle
+-- one cell deep and a one-cell-deep rectangle is within tolerance of a line.
+-- That is not a bug in the fit, it is the tolerance meaning what it says -- and
+-- this map's stair steps are 35x2, so it is 22 rings.
+--
+-- The raw lattice outline is the safe answer but a terrible one: 70 vertices
+-- for a rectangle. When the ring's cells are exactly the border of their own
+-- bounding box, though, the shape IS that box, and the box is four vertices.
+-- Note what this does NOT do: it reads cell indices only. No part is consulted,
+-- so it holds for a Union or a MeshPart exactly as it does for a Block.
+local function boxIfExact(pts: {P2}, step: number): {P2}?
+	local lu, hu, lv, hv = math.huge, -math.huge, math.huge, -math.huge
+	for _, p in ipairs(pts) do
+		lu = math.min(lu, p.x); hu = math.max(hu, p.x)
+		lv = math.min(lv, p.z); hv = math.max(hv, p.z)
+	end
+	local w = math.floor((hu - lu) / step + 0.5) + 1
+	local h = math.floor((hv - lv) / step + 0.5) + 1
+	if w < 1 or h < 1 then return nil end
+	-- how many cells the border of a w x h box holds
+	local border = (w == 1 or h == 1) and (w * h) or (2 * w + 2 * h - 4)
+	if #pts ~= border then return nil end
+	local seen: {[string]: boolean} = {}
+	for _, p in ipairs(pts) do
+		local iu = math.floor((p.x - lu) / step + 0.5)
+		local iv = math.floor((p.z - lv) / step + 0.5)
+		-- every point must actually lie ON the border, or the counts agreeing was
+		-- a coincidence and the shape is something else
+		if iu ~= 0 and iu ~= w - 1 and iv ~= 0 and iv ~= h - 1 then return nil end
+		local k = iu .. ":" .. iv
+		if seen[k] then return nil end
+		seen[k] = true
+	end
+	return {
+		{ x = lu, z = lv }, { x = hu, z = lv }, { x = hu, z = hv }, { x = lu, z = hv },
+	}
+end
+
 --------------------------------------------------------------------------
 -- STEP 8 — clean up, and all of it BEFORE any corner is intersected
 --------------------------------------------------------------------------
@@ -444,8 +486,14 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local segs = mergeSegments(pts, segmentLoop(pts, c), c)
 		stats.rawSegments += #segs
 		if #segs < 3 then
-			stats.rawRings += 1
-			rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			local box = boxIfExact(pts, step)
+			if box then
+				stats.boxRings += 1
+				rings[#rings + 1] = { pts2 = box, area = signed2(box) }
+			else
+				stats.rawRings += 1
+				rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			end
 			continue
 		end
 
@@ -499,8 +547,14 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			end
 		end
 		if #verts < 3 then
-			stats.rawRings += 1
-			rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			local box = boxIfExact(pts, step)
+			if box then
+				stats.boxRings += 1
+				rings[#rings + 1] = { pts2 = box, area = signed2(box) }
+			else
+				stats.rawRings += 1
+				rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
+			end
 			continue
 		end
 		rings[#rings + 1] = { pts2 = verts, area = signed2(verts) }
@@ -556,7 +610,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		regions = 0, holes = 0, verts = 0, emptyGrids = 0,
 		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
 		-- rings the fit could not resolve, kept as their raw lattice outline
-		rawRings = 0,
+		rawRings = 0, boxRings = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
