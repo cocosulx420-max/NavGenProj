@@ -383,7 +383,7 @@ function LocalGrid.visualizeClasses(data: any, parent: Instance?)
 		for _, cell in ipairs(g.cells) do
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
-			dot.Material = Enum.Material.Neon
+			dot.Material = Enum.Material.SmoothPlastic
 			local col, w = PLAIN, 0.55
 			if cell.wall and cell.dropoff then col, w = BOTH, 0.9
 			elseif cell.wall then col, w = WALL, 0.9
