@@ -111,6 +111,34 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
+	-- The same surface is now reachable from several leaves, so a column may be
+	-- probed more than once. Key on cell and height so the index holds each
+	-- surface once.
+	local seen: {[string]: boolean} = {}
+
+	-- The floor of the whole tree, not of this leaf. THIS IS THE POINT.
+	--
+	-- The down-ray used to be clipped to the leaf that spawned it (`edge + 2`),
+	-- which silently assumed the surface under a column is inside the same leaf
+	-- as whatever sits above it. At a wall it is not. The SVO is deliberately
+	-- conservative, so a wall's voxels over-cover its footprint by up to a leaf;
+	-- the ground leaf then skips that column on the empty-above guard (line
+	-- below), and the wall's own leaf casts a ray far too short to reach the
+	-- ground ten studs down. Neither leaf claims it, and the cell comes out with
+	-- no surfel at all.
+	--
+	-- That is one missing cell hugging the base of every wall and the lip of
+	-- every stair riser. Downstream they are not read as seams -- they are read
+	-- as one-cell OBSTACLES, fall to the raw-ring fallback, and get drawn as a
+	-- hexagon expanded by the agent radius. 100 of SmallMap's 102 "holes" were
+	-- this, marching in a diagonal line down every edge in the map.
+	--
+	-- Casting to the bottom of the tree can only ADD surfels, never move one:
+	-- the ray still stops at the first surface it meets. Clearance above them is
+	-- measured against real geometry a few lines down, not against the
+	-- conservative voxels, so a column that really is buried still reports
+	-- clearance 0 and is filtered where it always was.
+	local floorY = tree.center.Y - tree.half - 1
 
 	tree:forEachSolidLeaf(function(ctr: Vector3, h: number)
 		local edge = 2 * h
@@ -120,8 +148,11 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				local cx = ctr.X - h + 0.5 + i
 				local cz = ctr.Z - h + 0.5 + j
 				if tree:isSolid(Vector3.new(cx, top + 0.5, cz)) then continue end
-				local res = workspace:Raycast(Vector3.new(cx, top + 1, cz), Vector3.new(0, -(edge + 2), 0), rp)
+				local res = workspace:Raycast(Vector3.new(cx, top + 1, cz), Vector3.new(0, floorY - (top + 1), 0), rp)
 				if not res then continue end
+				local dk = cellKey(cx, cz) .. "|" .. math.floor(res.Position.Y * 4 + 0.5)
+				if seen[dk] then continue end
+				seen[dk] = true
 				local n = res.Normal
 				local slope = math.deg(math.acos(math.clamp(n:Dot(UP), -1, 1)))
 				local isClip = res.Instance.Name:find("ClipRamp") ~= nil
