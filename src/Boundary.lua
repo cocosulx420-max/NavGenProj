@@ -641,8 +641,19 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local lines: {any} = {}
 		for _, sg in ipairs(segs) do
 			local nrm = outwardOf(sg.dir)
+			local cval = dot(sg.cen, nrm)
+			-- Balance is structural, not hoped for: the fit runs through the
+			-- centroid, so the signed offsets of its own nodes sum to zero. Kept
+			-- as a measured invariant because the previous version's outward
+			-- translation broke it silently.
+			if #sg.idx >= 2 then
+				local acc = 0
+				for _, i in ipairs(sg.idx) do acc += dot(pts[i], nrm) - cval end
+				local mean = math.abs(acc / #sg.idx)
+				if mean > stats.worstLean then stats.worstLean = mean end
+			end
 			lines[#lines + 1] = {
-				n = nrm, c = dot(sg.cen, nrm),
+				n = nrm, c = cval,
 				anchor = pts[sg.idx[#sg.idx]], class = sg.class,
 			}
 		end
@@ -779,6 +790,8 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0,
+		-- worst mean signed distance from a line to its own nodes; 0 = balanced
+		worstLean = 0,
 	}
 
 	for part, g in pairs(localData.grids) do
