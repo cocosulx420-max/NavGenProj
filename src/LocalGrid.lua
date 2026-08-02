@@ -364,7 +364,14 @@ end
 
 -- Debug viz for classifyNodes: red = wall, blue = dropoff, purple = both,
 -- grey = interior. Tiles are oriented to their grid like the main viz.
-function LocalGrid.visualizeClasses(data: any, parent: Instance?)
+-- `opts.interior = false` omits the 91% of tiles that are neither wall nor
+-- dropoff. Nothing here is transparent: a transparent part costs alpha blending
+-- and a depth sort, and 46k of them is what made this viz lag when the opaque
+-- one at the same tile count did not.
+function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local showInterior = o.interior ~= false
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -377,19 +384,19 @@ function LocalGrid.visualizeClasses(data: any, parent: Instance?)
 	local WALL = Color3.fromRGB(255, 70, 70)
 	local DROP = Color3.fromRGB(70, 160, 255)
 	local BOTH = Color3.fromRGB(220, 90, 255)
-	local PLAIN = Color3.fromRGB(70, 70, 78)
+	local PLAIN = Color3.fromRGB(58, 58, 66)
 	local step = data.config.step
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
-			local dot = Instance.new("Part")
-			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
-			dot.Material = Enum.Material.SmoothPlastic
 			local col, w = PLAIN, 0.55
 			if cell.wall and cell.dropoff then col, w = BOTH, 0.9
 			elseif cell.wall then col, w = WALL, 0.9
 			elseif cell.dropoff then col, w = DROP, 0.9 end
+			if col == PLAIN and not showInterior then continue end
+			local dot = Instance.new("Part")
+			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
+			dot.Material = Enum.Material.SmoothPlastic
 			dot.Color = col
-			dot.Transparency = (col == PLAIN) and 0.75 or 0
 			dot.Size = Vector3.new(w * step, 0.08, w * step)
 			if not g.fallback and g.n and g.u then
 				dot.CFrame = CFrame.fromMatrix(cell.pos + Vector3.new(0, 0.12, 0), g.u, g.n)
