@@ -249,12 +249,31 @@ local function segmentLoop(pts: {P2}, c: any)
 	local segs: {any} = {}
 	local cur = { 1 }
 	for i = 2, n do
+		-- REVERSAL ENDS A RUN, and the residual test cannot see it.
+		--
+		-- DESIGN.md makes this point about step 8 -- "an abs test calls a
+		-- 180-degree reversal collinear" -- but step 4 has the same blindness and
+		-- it bites harder. Round the end of a strip narrower than fitTol and the
+		-- walk comes back down the other side; every returning cell is within
+		-- tolerance of the line fitted to the side it just left, so the fit never
+		-- fails, the run swallows the entire ring, and a 35x2 stair step comes
+		-- out as one or two segments instead of a rectangle. That is 36 of this
+		-- map's parts.
+		--
+		-- Travel direction is the thing that actually changed, so test it. A
+		-- corner turns; only the far end of a thin strip reverses.
+		local reversed = false
+		if #cur >= 2 then
+			local travel = sub(pts[i], pts[i - 1])
+			local run = sub(pts[cur[#cur]], pts[cur[1]])
+			if dot(travel, run) < 0 then reversed = true end
+		end
 		local trial = table.clone(cur)
 		trial[#trial + 1] = i
 		local cen, dir = fitLine(pts, trial)
 		-- MAXIMUM residual, never the average: an average lets a shallow corner
 		-- hide inside a long run, which is precisely the corner worth keeping.
-		if maxResidual(pts, trial, cen, dir) > c.fitTol then
+		if reversed or maxResidual(pts, trial, cen, dir) > c.fitTol then
 			-- Close the run and start the next one AT this point, so the two
 			-- segments share it.
 			local ce, de = fitLine(pts, cur)
@@ -281,6 +300,10 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 	local cosLim = math.cos(math.rad(c.collinearDeg))
 
 	local function refit(a: any, b: any): any?
+		-- never across a reversal, for the same reason step 4 breaks on one: the
+		-- two sides of a thin strip are within fitTol of each other, so the
+		-- residual test alone would happily weld them into one segment
+		if dot(a.dir, b.dir) < 0 then return nil end
 		local idx = table.clone(a.idx)
 		local seen: {[number]: boolean} = {}
 		for _, i in ipairs(idx) do seen[i] = true end
