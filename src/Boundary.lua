@@ -710,6 +710,14 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				stats.cornersClamped += 1
 				p = anchorNow
 			end
+			-- A vertex is never allowed to go missing quietly. Appending nil here
+			-- is a no-op on the array while the class still lands, which desyncs
+			-- the two and deletes a corner without a trace -- that is exactly how
+			-- three runs' worth of the Union's crescent disappeared.
+			if not p then
+				stats.cornersLost += 1
+				return
+			end
 			verts[#verts + 1] = p
 			vcls[#vcls + 1] = k
 		end
@@ -718,9 +726,12 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
 			-- the edge LEAVING this corner runs along l2, so it carries l2's class
 			local leaving = l2.class
-			anchorNow = anchor
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
 			local anchor = l1.anchor
+			-- AFTER `anchor` exists. Assigned before it, this read the outer
+			-- scope, found nothing, and left the clamp fallback nil for every
+			-- corner in the bake.
+			anchorNow = anchor
 			if math.abs(det) < 1e-6 then
 				-- near-parallel: fall back to the foot of the anchor on l1
 				stats.unstableCorners += 1
@@ -846,7 +857,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- boundary edges by class; seam edges are joins, not boundaries
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
-		cornersOffMask = 0, cornersClamped = 0,
+		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0, cornersTrimmed = 0,
 	}
