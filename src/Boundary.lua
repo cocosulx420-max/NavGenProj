@@ -398,7 +398,7 @@ end
 -- STEP 8 — clean up, and all of it BEFORE any corner is intersected
 --------------------------------------------------------------------------
 
-local function mergeSegments(pts: {P2}, segs: {any}, c: any)
+local function mergeSegments(pts: {P2}, segs: {any}, c: any, stats: any)
 	local cosLim = math.cos(math.rad(c.collinearDeg))
 
 	local function refit(a: any, b: any, force: boolean?): any?
@@ -435,6 +435,76 @@ local function mergeSegments(pts: {P2}, segs: {any}, c: any)
 			if m then
 				segs[1] = m
 				segs[#segs] = nil
+			end
+		end
+	end
+
+	-- SLIDE THE BREAK POINT BEFORE JUDGING THE CORNER.
+	--
+	-- The greedy fit is order-dependent. It walks forward and locks a run's end
+	-- at the first node whose residual fails, then leaves the next run to pick up
+	-- whatever is left -- including a node that really belonged to the run
+	-- behind. That inherited node tilts the next line, and the tilt forces
+	-- another break, so one misplaced boundary produces two segments with a
+	-- meaningless angle between them.
+	--
+	-- Measured: on SmallMap's ground slab, a 50.9-stud run stops one node short
+	-- and the following stretch comes out as two edges 11.8 degrees apart,
+	-- covering nodes that lie along a single straight line. Map-wide, 101 of 532
+	-- corners turn by less than 20 degrees.
+	--
+	-- So before deciding whether a corner is real, try moving the boundary
+	-- between each pair of runs a couple of nodes either way and keep whichever
+	-- placement fits both runs best. The merge below then sees the arrangement
+	-- the fit would have found had it not been greedy.
+	local function contiguous(idx: {number}): boolean
+		for i = 2, #idx do
+			if idx[i] ~= idx[i - 1] + 1 then return false end
+		end
+		return true
+	end
+	local slid = true
+	while slid do
+		slid = false
+		for k = 1, #segs do
+			local a = segs[k]
+			local b = segs[k % #segs + 1]
+			if a ~= b and a.class == b.class and contiguous(a.idx) and contiguous(b.idx)
+				and a.idx[#a.idx] + 1 == b.idx[1] and #a.idx >= 2 and #b.idx >= 2
+			then
+				local lo, hi = a.idx[1], b.idx[#b.idx]
+				local function scoreAt(cut: number): number?
+					if cut - lo + 1 < 2 or hi - cut < 2 then return nil end
+					local ia, ib = {}, {}
+					for i = lo, cut do ia[#ia + 1] = i end
+					for i = cut + 1, hi do ib[#ib + 1] = i end
+					local ca, da = fitLine(pts, ia)
+					local cb, db = fitLine(pts, ib)
+					return math.max(maxResidual(pts, ia, ca, da), maxResidual(pts, ib, cb, db))
+				end
+				local cut0 = a.idx[#a.idx]
+				local best, bestCut = scoreAt(cut0), cut0
+				if best then
+					for d = -2, 2 do
+						if d ~= 0 then
+							local sc = scoreAt(cut0 + d)
+							-- a clear improvement only; ties keep the fit's own choice
+							if sc and sc < best - 1e-6 then best, bestCut = sc, cut0 + d end
+						end
+					end
+					if bestCut ~= cut0 then
+						local ia, ib = {}, {}
+						for i = lo, bestCut do ia[#ia + 1] = i end
+						for i = bestCut + 1, hi do ib[#ib + 1] = i end
+						local ca, da = fitLine(pts, ia)
+						local cb, db = fitLine(pts, ib)
+						segs[k] = { idx = ia, cen = ca, dir = da, class = a.class }
+						segs[k % #segs + 1] = { idx = ib, cen = cb, dir = db, class = b.class }
+						stats.breaksSlid += 1
+						slid = true
+						break
+					end
+				end
 			end
 		end
 	end
@@ -604,7 +674,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
 		local rawSegs = segmentLoop(pts, c, cls)
-		local segs = mergeSegments(pts, rawSegs, c)
+		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
 		if c.debugPart and g.part == c.debugPart then
 			local function snap(list)
@@ -835,7 +905,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- boundary edges by class; seam edges are joins, not boundaries
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
-		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0,
+		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
