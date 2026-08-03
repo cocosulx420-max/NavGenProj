@@ -83,11 +83,11 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
-	-- Swept against 27 corners Cocosulx marked by hand on SmallMap. 25/1 finds
-	-- every one of them; widening the window to 3 loses 6, and raising the angle
-	-- to 50 loses 8. The wobble a window was meant to smooth turns out not to
-	-- need smoothing once the normal is built from all 8 directions.
-	cornerWindow = 1,
+	-- Swept against 51 corners Cocosulx marked by hand, matched node for node.
+	-- Window 2 peaks at 30; window 1 gets 22 and window 4 gets 23. The angle
+	-- hardly matters between 20 and 30, which says what is left is not the
+	-- threshold but WHICH node of a wobbling staircased rim wins the comparison.
+	cornerWindow = 2,
 	cornerAngle = 25,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
 	cornerSpan = 0,
