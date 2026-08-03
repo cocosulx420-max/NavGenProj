@@ -719,6 +719,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- the duplicate carries no information, so collapse it.
 		local pts: {P2} = {}
 		local cls: {string} = {}
+		local owner: {any} = {}
 		local lastCell, lastCls = nil, nil
 		for _, s in ipairs(loop) do
 			local k = classOf(g, s)
@@ -728,6 +729,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			if s.cell ~= lastCell or k ~= lastCls then
 				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
 				cls[#cls + 1] = k
+				owner[#owner + 1] = s.cell
 				lastCell, lastCls = s.cell, k
 			end
 			stats.edges += 1
@@ -1011,7 +1013,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
+		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, edgeCorners = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}

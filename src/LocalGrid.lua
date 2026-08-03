@@ -16,11 +16,10 @@ export type Cell = {
 	dropMask: number?,        -- directions with nothing to stand on
 	wall: boolean?,
 	dropoff: boolean?,
-	-- A node where its own boundary turns: two perpendicular directions blocked
-	-- by the same thing. Set per class, because a node can be a corner of the
-	-- wall it runs along without being a corner of anything else.
-	wallCorner: boolean?,
-	dropCorner: boolean?,
+	-- Set by Boundary: this node is where a drawn edge begins and the one before
+	-- it ends. Not a geometric property of the node -- it is wherever the fit
+	-- decided one straight line had to stop and the next start.
+	edgeCorner: boolean?,
 }
 
 export type DeadCell = {
@@ -217,23 +216,6 @@ local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 	return grid
 end
 
--- Are two PERPENDICULAR cardinal directions both set in this mask? Cardinals sit
--- at bits 1, 3, 5, 7 of DIR8, so perpendicular pairs are two bits apart, and
--- opposite ones are four apart and do not count -- a node in a one-cell slot has
--- masonry both sides and is not a corner.
-local function perpendicular(mask: number): boolean
-	if mask == 0 then return false end
-	local card = {}
-	for i, b in ipairs({ 1, 3, 5, 7 }) do
-		card[i] = bit32.band(mask, bit32.lshift(1, b - 1)) ~= 0
-	end
-	for i = 1, 4 do
-		local j = i % 4 + 1
-		if card[i] and card[j] then return true end
-	end
-	return false
-end
-
 -- The 8 local directions, starting east and going counter-clockwise.
 local DIR8 = {
 	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
@@ -364,23 +346,13 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 			-- south -- and that is the whole test. Cardinals only, because the
 			-- diagonals of a straight run are blocked too and would call every
 			-- node a corner.
-			cell.wallCorner = perpendicular(wallMask)
-			cell.dropCorner = perpendicular(dropMask)
 			if cell.wall then nWall += 1 end
 			if cell.dropoff then nDrop += 1 end
 			if cell.wall and cell.dropoff then nBoth += 1 end
 		end
 	end
 
-	local nWallC, nDropC = 0, 0
-	for _, g in pairs(data.grids) do
-		for _, cell in ipairs(g.cells) do
-			if cell.wallCorner then nWallC += 1 end
-			if cell.dropCorner then nDropC += 1 end
-		end
-	end
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
-	data.stats.wallCorners, data.stats.dropCorners = nWallC, nDropC
 	return data
 end
 
@@ -461,8 +433,9 @@ function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
 			elseif cell.wall then col, w = WALL, 0.9
 			elseif cell.dropoff then col, w = DROP, 0.9 end
 			-- A corner keeps its class colour and goes darker, so it reads as
-			-- "this kind of node, at a turn" rather than as a fourth class.
-			if (cell.wall and cell.wallCorner) or (cell.dropoff and cell.dropCorner) then
+			-- "this kind of node, where an edge breaks" rather than as a fourth
+			-- class. Set by Boundary, so it only shows after a bake.
+			if cell.edgeCorner then
 				col = Color3.new(col.R * 0.45, col.G * 0.45, col.B * 0.45)
 			end
 			if col == PLAIN and not showInterior then continue end
