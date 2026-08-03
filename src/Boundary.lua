@@ -873,18 +873,22 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 						-- whichever was found first picked the wrong one and the
 						-- purity test then rejected it, so the apex it was meant to
 						-- catch was never inserted at all.
+						-- Both shared cells, tested explicitly. One of the two is
+						-- usually the solid the ring is turning around, so the lookup
+						-- returns nil for it -- and ipairs over a table whose first
+						-- entry is nil iterates zero times, so the apex was never
+						-- examined at all and every attempt to tighten the test
+						-- changed nothing.
 						local tip = nil
-						for _, cand in ipairs({
-							g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)],
-							g.index[(lastCell.ui + du) .. ":" .. lastCell.vi],
-						}) do
+						local a = g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)]
+						local b = g.index[(lastCell.ui + du) .. ":" .. lastCell.vi]
+						local function pure(cand): boolean
+							if not cand then return false end
 							local blocked = bit32.bor(cand.wallMask or 0, cand.dropMask or 0)
-							if bit32.band(blocked, CARDINALS) == 0
-								and bit32.band(blocked, DIAGONALS) ~= 0 then
-								tip = cand
-								break
-							end
+							return bit32.band(blocked, CARDINALS) == 0
+								and bit32.band(blocked, DIAGONALS) ~= 0
 						end
+						if pure(a) then tip = a elseif pure(b) then tip = b end
 						-- ONLY A PURE DIAGONAL IS AN APEX. Consecutive ring cells sit
 						-- diagonally all the way along a rotated rim, so the diagonal
 						-- step on its own says nothing -- inserting on it fired 396
