@@ -72,6 +72,12 @@ export type Config = {
 	-- How much further off the frozen line a node must sit than the worst so
 	-- far to count as GROWTH rather than the same offset seen again.
 	driftGrow: number?,
+	-- Adaptive admission: a node is on the line if it is within the run's own
+	-- spread plus this. Half a cell is the lattice quantisation of a line at any
+	-- angle, so this is derived rather than tuned. `adaptive = false` falls back
+	-- to the fixed `driftTol`, for A/B only.
+	driftSlack: number?,
+	adaptive: boolean?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -96,6 +102,8 @@ local DEFAULT = {
 	driftTol = 0.95,
 	driftSpan = 4,
 	driftGrow = 0.25,
+	driftSlack = 0.5,
+	adaptive = true,
 	classBreaks = true,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
@@ -343,6 +351,7 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 	local tol = c.driftTol
 	local span = math.max(1, math.floor(c.driftSpan))
 	local grow = c.driftGrow
+	local slack = c.driftSlack
 
 	local function sgn(x: number): number
 		return (x > 0) and 1 or ((x < 0) and -1 or 0)
@@ -472,8 +481,41 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 			local conf = { i }			-- nodes confirmed to lie on the line
 			local pend: {number} = {}	-- nodes seen since the line was frozen
 			local fu, fv, fdx, fdz = 0, 0, 0, 0	-- the frozen line
+			local spread = 0			-- how loosely this run's own nodes hug it
 			local devMax: number? = nil	-- worst offset so far while in question
 			local cutBefore: number? = nil
+
+			local function refit()
+				fu, fv, fdx, fdz = fitOf(conf)
+				spread = 0
+				for _, k in ipairs(conf) do
+					local d = offLine(k, fu, fv, fdx, fdz)
+					if d > spread then spread = d end
+				end
+			end
+
+			-- HOW FAR OFF IS STILL ON. Derived from the run, not from a constant.
+			--
+			-- A node belongs if it sits no further off than this run's own nodes
+			-- already do, plus the half cell that lattice quantisation costs any
+			-- line: cell centres are on a unit lattice, so a line at any angle has
+			-- its members within half a cell of it whatever the angle is.
+			--
+			-- A fixed threshold cannot do this. The first node past a right-angle
+			-- turn sits exactly 1.0 off the previous line ONLY when that turn is
+			-- axis-aligned; rotate the rim and it lands lower. driftTol = 0.95 was
+			-- measured as the best constant on SmallMap and had 0.05 of margin
+			-- against that -- fine here, because SmallMap's L-shapes are square,
+			-- and silently wrong on a map whose corners are not.
+			--
+			-- Adaptive has no such cliff. A dead-straight run has zero spread, so
+			-- ANY turn off it is a question regardless of angle; a staircase's
+			-- spread is its own natural wobble, so its steps stay admitted however
+			-- irregularly they fall.
+			local function admit(): number
+				if c.adaptive == false then return tol end
+				return spread + slack
+			end
 			local classEnd: number? = nil
 			local runCls = cls and cls[i] or nil
 			local j, moved = i, 0
@@ -519,12 +561,12 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 				-- run has enough nodes to have a shape at all.
 				if #conf < 3 then
 					conf[#conf + 1] = nxt
-					fu, fv, fdx, fdz = fitOf(conf)
+					refit()
 				elseif devMax == nil then
 					local d = offLine(nxt, fu, fv, fdx, fdz)
-					if d <= tol then
+					if d <= admit() then
 						conf[#conf + 1] = nxt
-						fu, fv, fdx, fdz = fitOf(conf)
+						refit()
 					else
 						-- a question: freeze here and watch
 						devMax = d
@@ -533,11 +575,11 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 					end
 				else
 					local d = offLine(nxt, fu, fv, fdx, fdz)
-					if d <= tol then
+					if d <= admit() then
 						-- it came back: phase, not a turn. Absorb and re-fit.
 						pend[#pend + 1] = nxt
 						for _, k in ipairs(pend) do conf[#conf + 1] = k end
-						fu, fv, fdx, fdz = fitOf(conf)
+						refit()
 						devMax, cutBefore, pend = nil, nil, {}
 					elseif d > (devMax :: number) + grow then
 						why = "drift"; break
