@@ -59,11 +59,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
-	-- Pass one. `staircaseWindow` moves behind the current one decide which axis
-	-- the run travels along; `phaseLookahead` moves are allowed for travel to
-	-- resume before an unbracketed step is believed.
+	-- Pass one. A run is established over `staircaseWindow` moves and ends when
+	-- its stepping rate rises by more than `rateJump` -- the character changing,
+	-- rather than the travel axis merely twitching.
 	staircaseWindow: number?,
-	phaseLookahead: number?,
+	rateJump: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -85,7 +85,7 @@ local DEFAULT = {
 	collinearDeg = 20,
 	miterLimit = 6.0,
 	staircaseWindow = 6,
-	phaseLookahead = 3,
+	rateJump = 0.5,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -267,33 +267,33 @@ end
 --------------------------------------------------------------------------
 -- PASS ONE — CORNERS, READ OFF THE STAIRCASE
 --
--- See CORNERS.md. A wall that is not aligned to the grid it is sampled on leaves
--- a staircase: a run of nodes that advances along one axis and occasionally
--- steps across to the other. Which axis is which is decided by the run, never
--- assumed, so a vertical staircase is the same object with the roles swapped.
+-- See CORNERS.md. This is a WALK, not a per-node classifier, and the difference
+-- is not cosmetic. A stateless version was tried: at every node, look back a
+-- window for the travel axis and forward a few moves for a resumption. It failed
+-- on half of all right-angle turns, and the reason is worth keeping written down.
 --
--- The rule is that A STEP MUST BE BRACKETED BY TRAVEL. A step that is never
--- followed by a resumption of travel was not part of the staircase, and the run
--- ended at the last travel move -- which is the corner. This replaces counting
--- steps: "three in a row" was a proxy for this with an arbitrary constant in it.
+-- When a run turns into a STAIRCASE, the new staircase's steps lie along the old
+-- run's travel axis. So "did my travel axis move again?" keeps answering yes,
+-- once every five or six moves, and the turn is forgiven. Measured on a labelled
+-- run: a vertical run turning into a horizontal staircase was missed entirely,
+-- and a false corner appeared two nodes later once the backward window had
+-- filled with the new run's moves. One fault, both symptoms.
 --
--- Lattice phase gets the benefit of the doubt. Two walls at the same angle half
--- a stud apart quantise differently, so an isolated unfollowed step is suspicion
--- rather than proof; travel is allowed a few moves to resume before the run is
--- declared over.
+-- What distinguishes them is not whether the axis twitches but how OFTEN. Before
+-- that turn the run was pure travel -- no steps at all. After it, five steps in
+-- six moves along the same axis. The axis is unchanged; the character is not.
 --
--- The travel axis is taken from the moves BEHIND the current one, not from a
--- window centred on it. A centred window straddles the corner and reports a
--- blend of both runs, which is exactly the information the rule needs to not
--- have.
+-- So a run is established, its stepping RATE measured, and the run ends when the
+-- rate changes sharply. Rate is also what survives the sub-cell offset that makes
+-- two walls at the same angle quantise differently, which is why CORNERS.md
+-- insists rules be stated in terms of it.
 --------------------------------------------------------------------------
 
 local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	local n = #lat
 	local isCorner = table.create(n, false)
-	if n < 6 then return isCorner end
+	if n < 8 then return isCorner end
 
-	-- move from node i to node i+1, in lattice steps
 	local mu, mv = table.create(n, 0), table.create(n, 0)
 	for i = 1, n do
 		local j = i % n + 1
@@ -301,38 +301,71 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 		mv[i] = lat[j][2] - lat[i][2]
 	end
 
-	local W = math.max(2, math.floor(c.staircaseWindow))
-	local look = math.max(1, math.floor(c.phaseLookahead))
+	local W = math.max(3, math.floor(c.staircaseWindow))
+	local jump = c.rateJump
 
-	for i = 1, n do
-		-- which axis has this run been travelling along, judged from behind
-		local su, sv = 0, 0
-		for k = 1, W do
-			local j = (i - 1 - k) % n + 1
-			su += math.abs(mu[j])
-			sv += math.abs(mv[j])
-		end
-		local major = (su >= sv) and mu or mv
-		local minor = (su >= sv) and mv or mu
-
-		-- a move that advances only across the run is a step
-		if major[i] == 0 and minor[i] ~= 0 then
-			local resumed = false
-			for k = 1, look do
-				if major[(i - 1 + k) % n + 1] ~= 0 then resumed = true; break end
+	-- Walk from `start`, laying down corners, until the whole ring is covered.
+	local function lap(start: number, mark: {boolean})
+		local i = start
+		local budget = 2 * n
+		while budget > 0 do
+			-- Establish the run: which axis it travels along, and how often it
+			-- steps. Both come from the moves AHEAD of the corner we are standing
+			-- on, never from behind it -- behind is the previous run.
+			local su, sv = 0, 0
+			for k = 0, W - 1 do
+				local j = (i - 1 + k) % n + 1
+				su += math.abs(mu[j])
+				sv += math.abs(mv[j])
 			end
-			if not resumed then
-				-- the run ended at the last move that actually travelled
-				for k = 0, n - 1 do
-					local j = (i - 1 - k) % n + 1
-					if major[j] ~= 0 then
-						isCorner[j % n + 1] = true
-						break
-					end
-				end
+			local major = (su >= sv) and mu or mv
+			local baseSteps = 0
+			for k = 0, W - 1 do
+				if major[(i - 1 + k) % n + 1] == 0 then baseSteps += 1 end
+			end
+			local baseRate = baseSteps / W
+
+			-- Follow it while it keeps that character.
+			local hist = table.create(W, 0)
+			local h, filled, sum = 1, 0, 0
+			local lastTravel: number? = nil
+			local j, moved = i, 0
+			while moved < n do
+				local isStep = (major[j] == 0) and 1 or 0
+				if isStep == 0 then lastTravel = j end
+				sum -= hist[h]
+				hist[h] = isStep
+				sum += isStep
+				h = h % W + 1
+				if filled < W then filled += 1 end
+				if filled == W and (sum / W) > baseRate + jump then break end
+				j = j % n + 1
+				moved += 1
+			end
+
+			budget -= math.max(moved, 1)
+			if lastTravel then
+				-- the run ended at the last move that actually travelled, and the
+				-- node it arrived at is the corner
+				local at = lastTravel % n + 1
+				if mark[at] then return end -- closed the loop
+				mark[at] = true
+				i = at
+			else
+				i = i % n + 1
 			end
 		end
 	end
+
+	-- One lap to find somewhere legitimate to begin, a second from there so the
+	-- first run is not the arbitrary one the ring's start point happens to give.
+	local seed = table.create(n, false)
+	lap(1, seed)
+	local start = 1
+	for k = 1, n do
+		if seed[k] then start = k; break end
+	end
+	lap(start, isCorner)
 	return isCorner
 end
 
