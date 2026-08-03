@@ -324,6 +324,7 @@ end
 local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: any?): {boolean}
 	local n = #lat
 	local isCorner = table.create(n, false)
+	local reason: {string} = {}
 	if n < 8 then return isCorner end
 
 	local mu, mv = table.create(n, 0), table.create(n, 0)
@@ -540,6 +541,7 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 				k = k % n + 1
 			end
 			mark[markAt] = true
+			if mark == isCorner then reason[markAt] = why end
 			if tally then tally[why] = (tally[why] or 0) + 1 end
 			i = consumeTo % n + 1
 			-- a run that consumed nothing would spin forever; step past it
@@ -559,7 +561,7 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 		if seed[k] then start = k; break end
 	end
 	lap(start, isCorner, tally)
-	return isCorner
+	return isCorner, reason
 end
 
 --------------------------------------------------------------------------
@@ -1080,7 +1082,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		if #pts < 3 then continue end
 
 		-- PASS ONE: corners, read off the staircase, before any line is fitted.
-		local corner = staircaseCorners(lat, cls, c, stats.ruleTally)
+		local corner, cornerWhy = staircaseCorners(lat, cls, c, stats.ruleTally)
 		if c.captureRings then
 			stats.ringDump = stats.ringDump or {}
 			stats.ringDump[#stats.ringDump + 1] =
@@ -1090,6 +1092,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			if corner[i] and owner[i] then
 				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
 				owner[i].edgeCorner = true
+				owner[i].cornerWhy = cornerWhy[i]
 			end
 		end
 
