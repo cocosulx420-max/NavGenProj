@@ -112,7 +112,7 @@ local DEFAULT = {
 	cornerDeg = 45,
 	maxGap = 3.0,
 	mergeNeedsFit = false,
-	insetAll = true,
+	insetAll = false,
 }
 
 local function merged(cfg): any
@@ -1154,18 +1154,20 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		for _, sg in ipairs(segs) do
 			local nrm = outwardOf(sg.dir)
 			local cval = dot(sg.cen, nrm)
-			-- A WALL LINE PULLS BACK OFF THE WALL.
+			-- THE LINE SITS ON THE AVERAGE OF ITS NODES.
 			--
-			-- Balanced is right for a ledge, where the boundary is the edge of the
-			-- floor and there is nothing to clip. It is wrong against masonry: a
-			-- line through the centroid leaves half its nodes on the far side, so
-			-- the boundary cuts into the wall -- 66 of 521 edges ran outside the
-			-- walkable cells, one of them 29% of its length. Cocosulx would rather
-			-- the boundary sat back from a wall than traced it exactly.
+			-- Total least squares already puts it there: through the centroid,
+			-- minimising the summed squared distance to the nodes it holds, which
+			-- is what "follow the average" means.
 			--
-			-- So a wall line is moved in until no node of its own run lies outside
-			-- it. Erosion, and the safe direction.
-			if sg.class == WALL or c.insetAll then
+			-- It used to be shoved off that average onto its innermost node, and
+			-- wall lines were shoved unconditionally -- the flag below only ever
+			-- governed the other classes. The reason was that edges cut into
+			-- masonry, and moving the line back was the only defence available.
+			-- Verified growth is a better one: a run can no longer take a node it
+			-- cannot see past, so nothing has to be given up in advance to make up
+			-- for it. With the inset off, no edge crosses solid anyway.
+			if c.insetAll then
 				local inner = math.huge
 				for _, i in ipairs(sg.idx) do
 					local d = dot(pts[i], nrm)
