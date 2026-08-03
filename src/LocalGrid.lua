@@ -432,11 +432,14 @@ function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
 			if cell.wall and cell.dropoff then col, w = BOTH, 0.9
 			elseif cell.wall then col, w = WALL, 0.9
 			elseif cell.dropoff then col, w = DROP, 0.9 end
-			-- A corner keeps its class colour and goes darker, so it reads as
-			-- "this kind of node, where an edge breaks" rather than as a fourth
-			-- class. Set by Boundary, so it only shows after a bake.
+			-- A corner keeps its class colour and goes toward white, so it reads
+			-- as "this kind of node, where an edge breaks" rather than as a
+			-- fourth class. Lighter rather than darker: a dark tile is hard to
+			-- separate from shadow, and these have to be picked out by eye
+			-- against a map that is mostly in shade. Set by Boundary, so it only
+			-- shows after a bake.
 			if cell.edgeCorner then
-				col = Color3.new(col.R * 0.22, col.G * 0.22, col.B * 0.22)
+				col = col:Lerp(Color3.new(1, 1, 1), 0.65)
 			end
 			if col == PLAIN and not showInterior then continue end
 			local dot = Instance.new("Part")
