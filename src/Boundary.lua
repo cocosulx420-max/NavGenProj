@@ -59,11 +59,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
-	-- Pass one. A run is established over `staircaseWindow` moves and ends when
-	-- its stepping rate rises by more than `rateJump` -- the character changing,
-	-- rather than the travel axis merely twitching.
+	-- Pass one. `staircaseWindow` moves decide which axis a run travels along and
+	-- how far ahead a step looks for travel to continue; the run ends when less
+	-- than `travelFloor` of that window is travel.
 	staircaseWindow: number?,
-	rateJump: number?,
+	travelFloor: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -85,7 +85,7 @@ local DEFAULT = {
 	collinearDeg = 20,
 	miterLimit = 6.0,
 	staircaseWindow = 6,
-	rateJump = 0.5,
+	travelFloor = 0.5,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -302,7 +302,6 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	end
 
 	local W = math.max(3, math.floor(c.staircaseWindow))
-	local jump = c.rateJump
 
 	-- Walk from `start` until every move on the ring has been consumed.
 	--
@@ -329,52 +328,47 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 			end
 			local major = (su >= sv) and mu or mv
 
-			-- Follow it while it keeps its character.
+			-- Follow it while travel keeps coming.
 			--
-			-- THE BASELINE TRACKS THE RUN. It used to be measured once over the
-			-- run's first few moves and then frozen, which fails whenever a run
-			-- begins somewhere awkward: the baseline is contaminated from the
-			-- outset and every corner afterwards is judged against a rate the run
-			-- never actually had. The labelled corner on Part06 sits behind six
-			-- pure-travel moves and a turn into a staircase -- rate 0 against 0.83,
-			-- which no threshold could miss -- and it was missed anyway, because
-			-- the run reached it carrying a baseline from far earlier.
+			-- A STEP IS BRACKETED IF TRAVEL IS STILL MOSTLY WHAT FOLLOWS IT.
 			--
-			-- So the run's character is everything it has done EXCEPT its last few
-			-- moves, and the comparison is against those last few. History grows
-			-- as the run proceeds, so a long straight rim is judged against itself
-			-- rather than against wherever the walk happened to begin.
-			local hist = table.create(W, 0)
-			local h, filled, recent = 1, 0, 0
-			local histSteps, histMoves = 0, 0
-			local minHist = math.max(2, math.ceil(W / 2))
+			-- Two weaker tests were tried first and both are recorded here because
+			-- each failed for a reason worth not repeating.
+			--
+			-- "Does the travel axis move again within a few?" forgives every turn
+			-- into a staircase, because the new staircase's steps lie along the old
+			-- run's travel axis -- so the axis does keep twitching, once every five
+			-- or six moves, and the turn is never seen.
+			--
+			-- Comparing the run's recent stepping rate against its own history
+			-- fixes that, but needs roughly two windows of run before it may speak.
+			-- Instrumented at the corner Cocosulx labelled: axis correct, recent
+			-- 0.17, history 0.00 -- and one single move of history, so the test was
+			-- not allowed to fire at all. Runs between real corners are routinely
+			-- shorter than the evidence that test demands.
+			--
+			-- Looking FORWARD needs no history. After a step, ask what the next few
+			-- moves are made of: on a straight staircase they are overwhelmingly
+			-- travel, five or six to the one step. Past a turn they are not --
+			-- beyond that corner only one move in six is travel on the old axis,
+			-- because the run now travels along the other one. Same window, no
+			-- warm-up, and it works on a run six moves long.
 			local lastTravel: number? = nil
 			local j, moved = i, 0
 			while moved < n do
-				local isStep = (major[j] == 0) and 1 or 0
-				if isStep == 0 then lastTravel = j end
-				-- the move falling out of the recent window becomes history
-				if filled == W then
-					histSteps += hist[h]
-					histMoves += 1
+				if major[j] ~= 0 then
+					lastTravel = j
 				else
-					filled += 1
-				end
-				recent -= hist[h]
-				hist[h] = isStep
-				recent += isStep
-				h = h % W + 1
-				-- Either direction ends the run: a staircase running into a
-				-- straight rim steps LESS, not more, and that is half of all turns.
-				if histMoves >= minHist
-					and math.abs(recent / W - histSteps / histMoves) > jump then
-					break
+					-- a step: is travel still what mostly follows?
+					local ahead = 0
+					for k = 1, W do
+						if major[(j - 1 + k) % n + 1] ~= 0 then ahead += 1 end
+					end
+					if ahead / W < c.travelFloor then break end
 				end
 				j = j % n + 1
 				moved += 1
-			end
-
-			-- The run owns the moves up to its last travelling one; anything past
+			end			-- The run owns the moves up to its last travelling one; anything past
 			-- that belongs to whatever comes next and must not be consumed here,
 			-- or the following run starts mid-stride and never establishes an axis.
 			local stop = lastTravel or j
