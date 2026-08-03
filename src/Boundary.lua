@@ -313,6 +313,11 @@ end
 local CARDINALS = 1 + 4 + 16 + 64
 local DIAGONALS = 2 + 8 + 32 + 128
 
+local DIR8 = {
+	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+}
+
 local DIR8N: {P2} = {}
 do
 	local r2 = math.sqrt(0.5)
@@ -936,6 +941,32 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 	-- is a point in the grid's own face coordinates on a live cell?
 	local function inMask(a: number, b: number): boolean
 		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
+	end
+
+	-- WHERE THE SOLID IS. Off the mask is not the same as inside something: a
+	-- boundary running a little past the cells onto a neighbour's floor has
+	-- crossed a seam, which is harmless. LocalGrid already recorded which of a
+	-- node's eight directions have something standing in them, so the solid cells
+	-- are the neighbours a wall node points at, minus any that are walkable.
+	local solid: {[string]: boolean}? = nil
+	local function isSolid(a: number, b: number): boolean
+		if not solid then
+			local t: {[string]: boolean} = {}
+			for _, cell in ipairs(g.cells) do
+				local mask = cell.wallMask or 0
+				if mask ~= 0 then
+					for bit = 1, 8 do
+						if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
+							local d = DIR8[bit]
+							local k = (cell.ui + d[1]) .. ":" .. (cell.vi + d[2])
+							if not g.index[k] then t[k] = true end
+						end
+					end
+				end
+			end
+			solid = t
+		end
+		return (solid :: any)[math.floor(a / step) .. ":" .. math.floor(b / step)] == true
 	end
 
 	local cliff = nil
