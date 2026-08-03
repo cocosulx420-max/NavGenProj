@@ -69,6 +69,9 @@ export type Config = {
 	driftTol: number?,
 	-- How many further nodes a run explores before believing a deviation.
 	driftSpan: number?,
+	-- How much further off the frozen line a node must sit than the worst so
+	-- far to count as GROWTH rather than the same offset seen again.
+	driftGrow: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -92,6 +95,7 @@ local DEFAULT = {
 	staircaseWindow = 6,
 	driftTol = 1.0,
 	driftSpan = 4,
+	driftGrow = 0.25,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -337,6 +341,7 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 	local W = math.max(3, math.floor(c.staircaseWindow))
 	local tol = c.driftTol
 	local span = math.max(1, math.floor(c.driftSpan))
+	local grow = c.driftGrow
 
 	local function sgn(x: number): number
 		return (x > 0) and 1 or ((x < 0) and -1 or 0)
@@ -351,7 +356,8 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 	-- walks steadily away from the twenty nodes behind. Measuring against all of
 	-- them is what makes that visible, and it is the same maximum-not-average
 	-- argument DESIGN.md makes for the fit itself.
-	local function worstOffLine(idx: {number}): number
+	-- Best-fit line through a set of nodes: centroid and unit direction.
+	local function fitOf(idx: {number}): (number, number, number, number)
 		local m = #idx
 		local su, sv = 0, 0
 		for _, k in ipairs(idx) do su += lat[k][1]; sv += lat[k][2] end
@@ -369,15 +375,12 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 		elseif suu >= svv then dx, dz = 1, 0
 		else dx, dz = 0, 1 end
 		local ml = math.sqrt(dx * dx + dz * dz)
-		if ml < 1e-12 then return 0 end
-		dx, dz = dx / ml, dz / ml
-		local worst = 0
-		for _, k in ipairs(idx) do
-			local du, dv = lat[k][1] - cu, lat[k][2] - cv
-			local r = math.abs(-du * dz + dv * dx)
-			if r > worst then worst = r end
-		end
-		return worst
+		if ml < 1e-12 then return cu, cv, 1, 0 end
+		return cu, cv, dx / ml, dz / ml
+	end
+
+	local function offLine(k: number, cu: number, cv: number, dx: number, dz: number): number
+		return math.abs(-(lat[k][1] - cu) * dz + (lat[k][2] - cv) * dx)
 	end
 
 	-- Walk from `start` until every move on the ring has been consumed.
@@ -438,34 +441,38 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 			-- the AXIS and a window wide enough to do that reliably may already
 			-- straddle the corner behind us.
 			--
-			-- Drift is the worst distance from the run's fitted line to any node it
-			-- has passed through, and ONE BAD NODE IS NOT PROOF. On the first node
-			-- that breaks tolerance the run goes tentative and keeps exploring for
-			-- `driftSpan` more nodes. If the line settles back inside tolerance it
-			-- was lattice phase and the run continues; if it keeps leaning, the
-			-- deviation is real.
+			-- RULE 3. GROWTH AWAY FROM A FROZEN LINE, NOT DISTANCE FROM A MOVING ONE.
 			--
-			-- WHERE IT BREAKS IS NOT WHERE IT NOTICED. The run is cut at the last
-			-- travel move before the deviation FIRST appeared, not at the node that
-			-- finally proved it. That is the whole reason for tracking the tentative
-			-- point separately -- exploring three or four nodes to be sure would
-			-- otherwise push every corner three or four nodes late.
+			-- The reference line is fitted to the nodes CONFIRMED to lie on it and
+			-- is then held still. Refitting it to include each new node was the flaw
+			-- in the previous version: leaving a straight rim for a staircase, the
+			-- line quietly tilts to accommodate the staircase and the residual never
+			-- grows enough to notice, so the break came several nodes late and
+			-- landed in the middle of the next feature.
 			--
-			-- This is what reaches case2. A long straight vertical rim meets a
-			-- staircase: the first horizontal move alone is unremarkable, the next
-			-- node going up is fine, but the one after that goes horizontal the same
-			-- way again, and by then the fitted line is measurably off the many
-			-- straight nodes behind it. Cut at the last vertical move, which is the
-			-- node marked by hand.
+			-- Against a frozen line the reading is unambiguous, and it is exactly
+			-- how Cocosulx drew it on the blue column:
 			--
-			-- A diagonal move advances BOTH axes, so it is judged on both -- it is a
-			-- travel and a step at once, never invisible.
+			--   first node off the line   -- a QUESTION, one node is never proof
+			--   next node no further off  -- NEUTRAL, no verdict, keep exploring
+			--   a node further off still  -- PROOF, the run is leaving its line
+			--
+			-- GROWTH is the test, never distance and never cadence. A real staircase
+			-- oscillates about its own line and never walks away from it, so it
+			-- survives any number of steps. A run that has left one feature for
+			-- another recedes monotonically and dies on the second sample.
+			--
+			-- And the cut goes back to the last node actually ON the line, not to
+			-- wherever the proof arrived -- otherwise exploring far enough to be
+			-- sure would push every corner that many nodes late.
 			local lastTravel: number? = nil
 			local why = "exhausted"
 			local tSign, sSign = 0, 0
-			local run = { i }			-- node indices accepted into this run
-			local tentAt: number? = nil		-- position in `run` where drift began
-			local tentTravel: number? = nil	-- lastTravel as it stood at that moment
+			local conf = { i }			-- nodes confirmed to lie on the line
+			local pend: {number} = {}	-- nodes seen since the line was frozen
+			local fu, fv, fdx, fdz = 0, 0, 0, 0	-- the frozen line
+			local devMax: number? = nil	-- worst offset so far while in question
+			local cutBefore: number? = nil
 			local classEnd: number? = nil
 			local runCls = cls and cls[i] or nil
 			local j, moved = i, 0
@@ -504,16 +511,39 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 				end
 
 				if dMaj ~= 0 then lastTravel = j end
-				run[#run + 1] = nxt
 
-				-- rule 3. Two points fit any line exactly, so it stays quiet until
-				-- there is enough run to have a shape at all.
-				if #run >= 4 then
-					if worstOffLine(run) > tol then
-						if tentAt == nil then tentAt = #run; tentTravel = lastTravel end
-						if #run - tentAt >= span then why = "drift"; break end
+				-- Two points fit any line exactly, so rule 3 stays quiet until the
+				-- run has enough nodes to have a shape at all.
+				if #conf < 3 then
+					conf[#conf + 1] = nxt
+					fu, fv, fdx, fdz = fitOf(conf)
+				elseif devMax == nil then
+					local d = offLine(nxt, fu, fv, fdx, fdz)
+					if d <= tol then
+						conf[#conf + 1] = nxt
+						fu, fv, fdx, fdz = fitOf(conf)
 					else
-						tentAt, tentTravel = nil, nil
+						-- a question: freeze here and watch
+						devMax = d
+						cutBefore = conf[#conf]
+						pend = { nxt }
+					end
+				else
+					local d = offLine(nxt, fu, fv, fdx, fdz)
+					if d <= tol then
+						-- it came back: phase, not a turn. Absorb and re-fit.
+						pend[#pend + 1] = nxt
+						for _, k in ipairs(pend) do conf[#conf + 1] = k end
+						fu, fv, fdx, fdz = fitOf(conf)
+						devMax, cutBefore, pend = nil, nil, {}
+					elseif d > (devMax :: number) + grow then
+						why = "drift"; break
+					else
+						if d > (devMax :: number) then devMax = d end
+						pend[#pend + 1] = nxt
+						-- Neutral forever is still an answer eventually; a run that
+						-- never rejoins its line has left it.
+						if #pend > span * 3 then why = "drift"; break end
 					end
 				end
 
@@ -523,7 +553,15 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 			-- The run owns the moves up to its last travelling one; anything past
 			-- that belongs to whatever comes next and must not be consumed here,
 			-- or the following run starts mid-stride and never establishes an axis.
-			local stop = (why == "drift" and tentTravel) or lastTravel or j
+			-- A drift break cuts to the last node ON the line, which is a NODE
+			-- index; everything else stops at a MOVE index and marks the node after
+			-- it. Converting here keeps the two conventions from mixing.
+			local stop
+			if why == "drift" and cutBefore then
+				stop = ((cutBefore - 2) % n) + 1
+			else
+				stop = lastTravel or j
+			end
 			-- A class break owns its boundary node outright, so it both consumes
 			-- and marks that node and hands the next run the far side of the seam.
 			-- Anything else stops at its last travel move and leaves the rest to
