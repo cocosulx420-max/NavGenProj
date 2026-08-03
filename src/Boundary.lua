@@ -59,13 +59,16 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
-	-- Pass one. `staircaseWindow` moves decide which axis a run travels along --
-	-- that is all it does now. The run then ends on a travel reversal, a step
-	-- reversal, or a node sitting more than `driftTol` cells off the heading the
-	-- run has averaged so far. The first two are exact; `driftTol` is the only
-	-- tolerance in pass one.
+	-- Pass one. The travel axis is named by the first axis to move twice in a
+	-- row; `staircaseWindow` is only the fallback for a 45-degree rim, which
+	-- alternates forever and never repeats. The run then ends on a travel
+	-- reversal, a step reversal, or the run's fitted line getting more than
+	-- `driftTol` cells from a node it already passed through. The first two are
+	-- exact; `driftTol` is the only tolerance in pass one.
 	staircaseWindow: number?,
 	driftTol: number?,
+	-- How many further nodes a run explores before believing a deviation.
+	driftSpan: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -87,7 +90,8 @@ local DEFAULT = {
 	collinearDeg = 20,
 	miterLimit = 6.0,
 	staircaseWindow = 6,
-	driftTol = 3.0,
+	driftTol = 1.0,
+	driftSpan = 4,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -331,9 +335,48 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 
 	local W = math.max(3, math.floor(c.staircaseWindow))
 	local tol = c.driftTol
+	local span = math.max(1, math.floor(c.driftSpan))
 
 	local function sgn(x: number): number
 		return (x > 0) and 1 or ((x < 0) and -1 or 0)
+	end
+
+	-- Worst perpendicular distance from the run's own best-fit line to ANY node
+	-- the run has passed through -- not just the newest one.
+	--
+	-- Testing only the incoming node against an average heading is blind to the
+	-- case this exists for. A line leaving a straight rim to chase a staircase
+	-- does not jump; it leans, and each new node is close to it while the line
+	-- walks steadily away from the twenty nodes behind. Measuring against all of
+	-- them is what makes that visible, and it is the same maximum-not-average
+	-- argument DESIGN.md makes for the fit itself.
+	local function worstOffLine(idx: {number}): number
+		local m = #idx
+		local su, sv = 0, 0
+		for _, k in ipairs(idx) do su += lat[k][1]; sv += lat[k][2] end
+		local cu, cv = su / m, sv / m
+		local suu, svv, suv = 0, 0, 0
+		for _, k in ipairs(idx) do
+			local du, dv = lat[k][1] - cu, lat[k][2] - cv
+			suu += du * du; svv += dv * dv; suv += du * dv
+		end
+		local tr = suu + svv
+		local disc = math.max(tr * tr * 0.25 - (suu * svv - suv * suv), 0)
+		local lam = tr * 0.5 + math.sqrt(disc)
+		local dx, dz
+		if math.abs(suv) > 1e-12 then dx, dz = lam - svv, suv
+		elseif suu >= svv then dx, dz = 1, 0
+		else dx, dz = 0, 1 end
+		local ml = math.sqrt(dx * dx + dz * dz)
+		if ml < 1e-12 then return 0 end
+		dx, dz = dx / ml, dz / ml
+		local worst = 0
+		for _, k in ipairs(idx) do
+			local du, dv = lat[k][1] - cu, lat[k][2] - cv
+			local r = math.abs(-du * dz + dv * dx)
+			if r > worst then worst = r end
+		end
+		return worst
 	end
 
 	-- Walk from `start` until every move on the ring has been consumed.
@@ -350,40 +393,78 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 		local visited = table.create(n, false)
 		local i, consumed = start, 0
 		while consumed < n do
-			-- Establish the run's AXIS -- only the axis -- from the moves AHEAD of
-			-- the corner it starts at. Behind is the previous run, which is exactly
-			-- what must not be read. Nothing about cadence is taken from here; the
-			-- window's whole job is deciding horizontal versus vertical.
-			local su, sv = 0, 0
-			for k = 0, W - 1 do
-				local j = (i - 1 + k) % n + 1
-				su += math.abs(mu[j])
-				sv += math.abs(mv[j])
+			-- THE AXIS IS NAMED BY THE FIRST REPEAT, NOT BY A WINDOW.
+			--
+			-- A staircase cannot read two-travel, two-step, two-travel, two-step.
+			-- The step is only what the travel gets quantised into, so travel is
+			-- the axis that moves twice in a row and step is the axis that never
+			-- does. The first axis to repeat on consecutive moves therefore names
+			-- the run outright, and no window length has to be guessed.
+			--
+			-- That matters because the window was the weakest thing here: six was
+			-- arbitrary, and a window straddling the corner behind us named the
+			-- axis wrong and made everything downstream of it wrong too.
+			--
+			-- A 45-degree rim strictly alternates and never repeats. That is not a
+			-- failure to read -- it is symmetric, so either axis is a correct
+			-- answer -- and it is the only case that still falls back to a window.
+			local axisU: boolean? = nil
+			do
+				local prev = 0		-- 1 = u, 2 = v, 0 = none or diagonal
+				local scan = math.min(n, W * 4)
+				for k = 0, scan - 1 do
+					local j = (i - 1 + k) % n + 1
+					local au, av = mu[j] ~= 0, mv[j] ~= 0
+					local cur = (au and not av) and 1 or ((av and not au) and 2 or 0)
+					if cur ~= 0 and cur == prev then axisU = (cur == 1); break end
+					prev = cur
+				end
 			end
-			local major = (su >= sv) and mu or mv
-			local minor = (su >= sv) and mv or mu
+			if axisU == nil then
+				local su, sv = 0, 0
+				for k = 0, W - 1 do
+					local j = (i - 1 + k) % n + 1
+					su += math.abs(mu[j])
+					sv += math.abs(mv[j])
+				end
+				axisU = su >= sv
+			end
+			local major = axisU and mu or mv
+			local minor = axisU and mv or mu
 
 			-- Follow it under the three rules. Signs latch on first sight rather
 			-- than being taken from the window, because the window is there to name
 			-- the AXIS and a window wide enough to do that reliably may already
 			-- straddle the corner behind us.
 			--
-			-- Drift is measured against the run's own average heading, anchored at
-			-- the running centroid of its nodes. Chord (last minus first) was the
-			-- obvious alternative and is wrong for the same reason CORNERS.md gives
-			-- for maximum-vs-average residual: a chord is pinned to two endpoints
-			-- and a shallow bend between them moves it barely at all.
+			-- Drift is the worst distance from the run's fitted line to any node it
+			-- has passed through, and ONE BAD NODE IS NOT PROOF. On the first node
+			-- that breaks tolerance the run goes tentative and keeps exploring for
+			-- `driftSpan` more nodes. If the line settles back inside tolerance it
+			-- was lattice phase and the run continues; if it keeps leaning, the
+			-- deviation is real.
+			--
+			-- WHERE IT BREAKS IS NOT WHERE IT NOTICED. The run is cut at the last
+			-- travel move before the deviation FIRST appeared, not at the node that
+			-- finally proved it. That is the whole reason for tracking the tentative
+			-- point separately -- exploring three or four nodes to be sure would
+			-- otherwise push every corner three or four nodes late.
+			--
+			-- This is what reaches case2. A long straight vertical rim meets a
+			-- staircase: the first horizontal move alone is unremarkable, the next
+			-- node going up is fine, but the one after that goes horizontal the same
+			-- way again, and by then the fitted line is measurably off the many
+			-- straight nodes behind it. Cut at the last vertical move, which is the
+			-- node marked by hand.
 			--
 			-- A diagonal move advances BOTH axes, so it is judged on both -- it is a
-			-- travel and a step at once, never invisible. That is what put case2 out
-			-- of reach of every step-pattern test: its rim turns via a diagonal and
-			-- so never registered a step to bracket.
+			-- travel and a step at once, never invisible.
 			local lastTravel: number? = nil
 			local why = "exhausted"
 			local tSign, sSign = 0, 0
-			local hu, hv = 0.0, 0.0		-- summed move vector: average heading
-			local cu, cv = lat[i][1] + 0.0, lat[i][2] + 0.0	-- centroid accumulator
-			local cn = 1
+			local run = { i }			-- node indices accepted into this run
+			local tentAt: number? = nil		-- position in `run` where drift began
+			local tentTravel: number? = nil	-- lastTravel as it stood at that moment
 			local j, moved = i, 0
 			while moved < n do
 				local dMaj, dMin = major[j], minor[j]
@@ -399,32 +480,27 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 				end
 
 				local nxt = j % n + 1
+				if dMaj ~= 0 then lastTravel = j end
+				run[#run + 1] = nxt
 
-				-- rule 3, the one tolerance: how far the incoming node sits off the
-				-- heading this run has averaged so far. Needs a heading to test
-				-- against, so it stays quiet until the run has two moves in it.
-				if cn >= 2 then
-					local hl = math.sqrt(hu * hu + hv * hv)
-					if hl > 1e-9 then
-						local ax, az = cu / cn, cv / cn
-						local du = lat[nxt][1] - ax
-						local dv = lat[nxt][2] - az
-						local perp = math.abs(du * (hv / hl) - dv * (hu / hl))
-						if perp > tol then why = "drift"; break end
+				-- rule 3. Two points fit any line exactly, so it stays quiet until
+				-- there is enough run to have a shape at all.
+				if #run >= 4 then
+					if worstOffLine(run) > tol then
+						if tentAt == nil then tentAt = #run; tentTravel = lastTravel end
+						if #run - tentAt >= span then why = "drift"; break end
+					else
+						tentAt, tentTravel = nil, nil
 					end
 				end
 
-				if dMaj ~= 0 then lastTravel = j end
-
-				hu += mu[j]; hv += mv[j]
-				cu += lat[nxt][1]; cv += lat[nxt][2]; cn += 1
 				j = nxt
 				moved += 1
 			end
 			-- The run owns the moves up to its last travelling one; anything past
 			-- that belongs to whatever comes next and must not be consumed here,
 			-- or the following run starts mid-stride and never establishes an axis.
-			local stop = lastTravel or j
+			local stop = (why == "drift" and tentTravel) or lastTravel or j
 			local before = consumed
 			local k = i
 			while true do
