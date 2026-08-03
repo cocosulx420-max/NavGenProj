@@ -16,6 +16,9 @@ export type Cell = {
 	dropMask: number?,        -- directions with nothing to stand on
 	wall: boolean?,
 	dropoff: boolean?,
+	-- Set by Boundary's pass one: this node is where a staircase ended, so an
+	-- edge begins here. Not a geometric property of the node on its own.
+	edgeCorner: boolean?,
 }
 
 export type DeadCell = {
@@ -419,6 +422,12 @@ function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
 			if cell.wall and cell.dropoff then col, w = BOTH, 0.9
 			elseif cell.wall then col, w = WALL, 0.9
 			elseif cell.dropoff then col, w = DROP, 0.9 end
+			-- A corner keeps its class hue and goes darker, so it reads as "this
+			-- kind of node, where a staircase ended" rather than as a new class.
+			-- Only appears after a bake, since Boundary sets it.
+			if cell.edgeCorner then
+				col = Color3.new(col.R * 0.28, col.G * 0.28, col.B * 0.28)
+			end
 			if col == PLAIN and not showInterior then continue end
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
