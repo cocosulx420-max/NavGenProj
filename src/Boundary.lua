@@ -89,14 +89,16 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
-	-- Swept against the corners Cocosulx marked by hand, matched node for node.
-	-- Once the tie is broken by structure rather than by swing size, window 1
-	-- wins clearly -- 41 of 50 exact against 36 at window 2 -- because a window
-	-- exists to smooth wobble and the apex rule no longer needs protecting from
-	-- it. The angle is flat anywhere from 10 to 22 and falls off a cliff at 25,
-	-- so 20 sits in the middle of the plateau rather than on its edge.
+	-- Swept on BOTH counts, because recall alone is a trap: with one node in nine
+	-- marked a corner, hitting 46 of 50 hand-marked corners meant very little.
+	-- Corners sitting in provably straight ground are the honest error measure.
+	--
+	-- On the fitted-line turn the false rate is flat at 35 of ~460 from 25
+	-- degrees upward, while recall holds at 43 of 50 until it breaks at 50. So 35
+	-- sits mid-plateau. Window 1, since the fitted turn already averages over
+	-- span nodes and a second window only blurs corners into their neighbours.
 	cornerWindow = 1,
-	cornerAngle = 20,
+	cornerAngle = 35,
 	cornerSplitSpan = 4,
 	cornerSplitTol = 0.05,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
