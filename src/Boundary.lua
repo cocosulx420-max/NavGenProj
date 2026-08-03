@@ -304,14 +304,23 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	local W = math.max(3, math.floor(c.staircaseWindow))
 	local jump = c.rateJump
 
-	-- Walk from `start`, laying down corners, until the whole ring is covered.
+	-- Walk from `start` until every move on the ring has been consumed.
+	--
+	-- Coverage is the termination condition, and it has to be. A first version
+	-- stopped as soon as a run ended on an already-marked corner, on the theory
+	-- that this meant the loop had closed. It does not: several runs can
+	-- legitimately end at the same node, and on a long ring that bailed out after
+	-- a handful of runs and left most of the boundary unwalked. Part06 has 2045
+	-- boundary nodes and reported 39 corners, while short rings looked perfectly
+	-- healthy at 4 apiece -- an aggregate that looks plausible and is mostly
+	-- unvisited ground.
 	local function lap(start: number, mark: {boolean})
-		local i = start
-		local budget = 2 * n
-		while budget > 0 do
-			-- Establish the run: which axis it travels along, and how often it
-			-- steps. Both come from the moves AHEAD of the corner we are standing
-			-- on, never from behind it -- behind is the previous run.
+		local visited = table.create(n, false)
+		local i, consumed = start, 0
+		while consumed < n do
+			-- Establish the run: which axis it travels along and how often it
+			-- steps, from the moves AHEAD of the corner it starts at. Behind is
+			-- the previous run, which is exactly what must not be read.
 			local su, sv = 0, 0
 			for k = 0, W - 1 do
 				local j = (i - 1 + k) % n + 1
@@ -343,15 +352,25 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				moved += 1
 			end
 
-			budget -= math.max(moved, 1)
-			if lastTravel then
-				-- the run ended at the last move that actually travelled, and the
-				-- node it arrived at is the corner
-				local at = lastTravel % n + 1
-				if mark[at] then return end -- closed the loop
-				mark[at] = true
-				i = at
-			else
+			-- The run owns the moves up to its last travelling one; anything past
+			-- that belongs to whatever comes next and must not be consumed here,
+			-- or the following run starts mid-stride and never establishes an axis.
+			local stop = lastTravel or j
+			local before = consumed
+			local k = i
+			while true do
+				if not visited[k] then
+					visited[k] = true
+					consumed += 1
+				end
+				if k == stop then break end
+				k = k % n + 1
+			end
+			mark[stop % n + 1] = true
+			i = stop % n + 1
+			-- a run that consumed nothing would spin forever; step past it
+			if consumed == before then
+				if not visited[i] then visited[i] = true; consumed += 1 end
 				i = i % n + 1
 			end
 		end
