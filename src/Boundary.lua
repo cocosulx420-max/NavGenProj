@@ -83,8 +83,12 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
-	cornerWindow = 3,
-	cornerAngle = 40,
+	-- Swept against 27 corners Cocosulx marked by hand on SmallMap. 25/1 finds
+	-- every one of them; widening the window to 3 loses 6, and raising the angle
+	-- to 50 loses 8. The wobble a window was meant to smooth turns out not to
+	-- need smoothing once the normal is built from all 8 directions.
+	cornerWindow = 1,
+	cornerAngle = 25,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
 	cornerSpan = 0,
 	cornerDeg = 45,
