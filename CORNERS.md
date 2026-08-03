@@ -46,43 +46,87 @@ document may name a fixed axis.
 
 **The pattern is not a property of the angle alone.** Two walls at the same angle
 half a stud apart quantise differently, so they produce different step patterns
-while representing identical geometry. Any rule that reads the raw pattern will
-disagree with itself across a sub-cell offset. What survives the offset is the
-**rate**: a 20-degree wall steps about once every three travels wherever it sits.
-Rules are stated in terms of rate, and raw patterns are only ever evidence.
+while representing identical geometry. An irregular staircase is still a
+staircase. **Therefore no rule here reads cadence at all.**
+
+Three attempts did, and each failed: counting steps, then requiring a step to be
+bracketed by travel, then measuring a stepping *rate* and ending the run when it
+changed. Two of the three measured as outright regressions against hand-marked
+corners. They share one premise — that the arrangement of steps identifies the
+wall — and that premise is false. Every such rule disagrees with itself across a
+sub-cell offset, and the tolerance that hides the disagreement also hides real
+turns: one knob, trading recall against precision monotonically.
+
+What identifies a run is not how it steps but **where it is going**.
 
 ## The rules
 
-### A step must be bracketed by travel
+Three, and the first two need no tolerance.
 
-A legitimate staircase reads travel…travel, step, travel…travel, step. A step
-that is not followed by a resumption of travel was never part of the staircase,
-and the run ended at the **last travel move** — which is the corner.
+### 1. Travel sign is fixed
 
-This replaces counting steps. "Three steps in a row" was only ever a proxy for
-this, and a proxy with an arbitrary constant in it. One unfollowed step is the
-same fact as three.
+A horizontal staircase goes left or right. Never both. A vertical one goes up or
+down, never both. A run that reverses along its own travel axis is not a messier
+version of the same staircase; it is a different one.
 
-### Lattice phase gets the benefit of the doubt
+This is exact — a reversal is proof, not evidence — so it is checked before any
+threshold gets a say in something already decided.
 
-Because of the sub-cell offset above, a single unfollowed step is *suspicion*,
-not proof. On meeting one, keep walking a short distance and ask whether the
-staircase **resumes with the same character**: same travel direction, same step
-direction, and roughly the same stepping rate.
+**It is not a formality.** DESIGN.md step 4 records this same fact discovered
+from the other side, as a pass-two bug: rounding the end of a strip narrower than
+`fitTol` brings the walk back down the other side, and every returning cell sits
+within tolerance of the line it just left, so the residual *never fails*. 36 of
+SmallMap's step parts collapsed entirely until a travel-direction test was added.
+Rule 3 below is blind to every one of those. It is cheaper to catch here.
 
-- resumes the same → it was phase, the run continues through it
-- rate or direction changed → the wall genuinely turned
+### 2. Step sign is fixed
 
-The lookahead is not a fixed constant. See "confidence is asymmetric" below.
+Our staircase steps down; a rim that steps up is not it. Also exact.
+
+This was already in this document, written as though it only applied when
+choosing between branches at a junction. It is not junction-specific — it holds
+on every move of every run, and the junction section now just refers to it.
+
+### 3. A run may not drift from its own average heading
+
+The only tolerance in pass one, and it exists for exactly one case: a rim that
+turns **without reversing** either sign, which is the shallow-angle turn.
+
+Keep a running average heading over the moves accepted so far, anchored at the
+running centroid of the run's nodes. While each new node sits close to that
+heading, the run continues *however irregularly it steps* — irregular
+quantisation is the same wall. When a node sits too far off it, the run has met a
+different staircase.
+
+Measured against the average, not against a chord from first node to last: a
+chord is pinned to its two endpoints and a shallow bend between them barely moves
+it, which is the same reason DESIGN.md uses maximum rather than average residual.
+
+### The trigger is not the corner
+
+All three rules answer one question — *is the run over* — and none of them says
+where the corner is. **The corner is the last travel move**, walked back to.
+
+This is the whole difference from the fit-failure corners this document rejects.
+Those let the residual failure *be* the corner, which is why they landed a node
+early and left a chamfer in the crook. Here the trigger only rings the bell; the
+position comes from the travel-axis rule and is exact. On a skim the two look
+like the same idea.
+
+### Diagonal moves are judged on both axes
+
+A diagonal advances travel and step at once, so it is tested as both and is never
+invisible. This is what put `case2` beyond every step-pattern rule: its rim turns
+via a diagonal, so it never registered a step to bracket, and a 74-node run with
+zero steps has no cadence to read either. It has a perfectly well-defined
+heading, which is what rule 3 reads.
 
 ### 45 degrees needs no special case
 
-At 45 degrees the pattern alternates strictly — travel, step, travel, step — so
-every step is bracketed and the run continues the whole way down, which is
-correct: a 45-degree rim is one straight staircase. It is also symmetric, so it
-does not matter which axis is called travel; both choices give the same answer.
-Near-45 rims produce the occasional doubled step from phase alone, which the rate
-check absorbs.
+At 45 degrees the rim advances on both axes every move with both signs constant,
+so rules 1 and 2 never fire and the heading is dead straight — one run the whole
+way down, which is correct. It is also symmetric, so it does not matter which
+axis is called travel.
 
 ### A junction is a question, not an answer
 
@@ -108,12 +152,12 @@ out which of them is my staircase, if any.*
 
 Explore each branch and reject it if:
 
-- **it steps the wrong way** — our staircase steps down, a branch that steps up
-  cannot be the same staircase whatever else it does
+- **it breaks rule 1 or rule 2** — a branch that travels backwards, or steps the
+  opposite way, cannot be this staircase whatever else it does. Nothing special
+  about junctions here; it is the same test applied to a candidate continuation.
 - **it is not actually connected** — a branch adjacent on screen but unreachable
   through walkable nodes is a different rim
-- **it is pure step** — no travel at all, which is the bracketing rule applied to
-  a branch
+- **it drifts** — a branch heading somewhere the run is not going, by rule 3
 
 If some branch survives, the run continues through the junction and it was never
 a corner. If none does, the run ends at the last travel move.
@@ -168,11 +212,13 @@ From DESIGN.md, unchanged:
 Three things this design could plausibly get wrong. None is settled by argument;
 each needs a bake on a map that contains the case.
 
-- **Curves may shatter.** The rules rest on a stepping rate, and a curved wall's
-  rate changes continuously -- 5 travels, then 3, then 2, then 1. The phase
-  lookahead could read that as a turn at every step and break a smooth curve into
-  micro-segments. The crescent-shaped Union on SmallMap is the nearest test case;
-  a real map will have far worse.
+- **Curves may shatter.** A curve bends continuously, so rule 3 must eventually
+  fire on it — the question is whether it fires at a sane interval or every few
+  nodes. Note the failure mode is now length-dependent rather than cadence-
+  dependent: drift accumulates with distance, so a long gentle curve breaks into
+  a few segments and a tight one into many, which is at least the right shape.
+  The crescent-shaped Union on SmallMap is the nearest test case; a real map will
+  have far worse.
 - **Single-cell noise may fake a corner.** One missing or offset cell on an
   otherwise straight wall creates an unbracketed step. Systematic dropouts of
   this kind existed until the leaf-clipped down-ray in `Floor` was fixed, so the
@@ -190,5 +236,11 @@ each needs a bake on a map that contains the case.
 - **Where exactly the corner vertex goes.** The corner *node* is the last travel
   move. Whether the drawn vertex sits on that node's centre or somewhere derived
   from the two runs' axes is a question for pass two.
-- **Near-45 rims.** The rate check should absorb phase-induced doubled steps.
-  This needs measuring on the real map rather than reasoning about.
+- **Which reference rule 3 should use.** Perpendicular distance from the run's
+  average heading is what is implemented. Average *direction* alone was the other
+  candidate. They behave differently at shallow angles — direction is insensitive
+  to a slow bend, position oversensitive on a long straight run — so this is
+  settled by measurement, not argument.
+- **How much work rule 3 is doing.** If it accounts for nearly every corner, the
+  exact rules are probably wrong. If it accounts for none, the tolerance is dead
+  weight. Worth reporting per-rule rather than only in aggregate.
