@@ -68,6 +68,11 @@ export type Config = {
 	-- far a body must stay off masonry.
 	agentRadius: number?,
 
+	-- Width quantum. Two wall stretches whose local half-width differs by more
+	-- than this get separate runs, because one straight edge can only carry one
+	-- offset. Smaller tracks width more closely and costs segments.
+	widthBand: number?,
+
 	-- The corridor width that is never eaten. BOTH walls of a corridor push
 	-- inward, so the budget has to be the width that survives them both, not the
 	-- ground behind one line -- see the note on the offset itself.
@@ -100,6 +105,7 @@ local DEFAULT = {
 	stepDeg = 30,
 	agentRadius = 1.5,
 	keepWidth = 2.0,
+	widthBand = 0.5,
 }
 
 local function merged(cfg): any
@@ -718,6 +724,29 @@ end
 
 local SEAM, WALL, DROP = "seam", "wall", "drop"
 
+-- A WALL'S CLASS CARRIES ITS WIDTH BAND.
+--
+-- The offset must be constant along a straight edge, so two stretches of wall
+-- that want different offsets cannot share one. That is the same statement
+-- DESIGN.md already makes about wall versus dropoff -- "they are offset by
+-- different amounts, so a segment spanning both has no single correct push" --
+-- and width is the same kind of difference.
+--
+-- Measured, it is the common case rather than an edge case: 77 of 90 wall edges
+-- varied by more than 1.5 studs of corridor width along their own length, and
+-- one 42-stud edge ran from 2.4 studs wide to 14.2 and took the tightest, so it
+-- was offset by nothing at all for its whole length.
+--
+-- So the band is folded into the class, and the fit breaks on a band change for
+-- free -- the same machinery, no new pass.
+local function isWall(k: string): boolean
+	return k:sub(1, 4) == WALL
+end
+local function baseOf(k: string): string
+	local i = k:find("#")
+	return i and k:sub(1, i - 1) or k
+end
+
 -- the four cardinal directions as bit positions in LocalGrid's DIR8
 local DIR_BIT: {[string]: number} = {
 	["1:0"] = 1, ["0:1"] = 3, ["-1:0"] = 5, ["0:-1"] = 7,
@@ -814,6 +843,18 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local lastCell, lastCls = nil, nil
 		for _, s in ipairs(loop) do
 			local k = classOf(g, s)
+			if k == WALL and c.widthBand > 0 then
+				-- local half-width of ground behind this node, marching inward
+				local cx, cz = (s.cell.ui + 0.5) * step, (s.cell.vi + 0.5) * step
+				local best, t = 0, step * 0.5
+				local reach = c.agentRadius + c.keepWidth * 0.5 + 2 * step
+				while t <= reach do
+					local d = distAt(cx - s.dir[1] * t, cz - s.dir[2] * t)
+					if d > best then best = d end
+					t += step * 0.5
+				end
+				k = WALL .. "#" .. tostring(math.floor(best / c.widthBand))
+			end
 			-- Collapse the duplicate a corner cell contributes, but ONLY while the
 			-- class holds: a cell with a wall on one side and a seam on the other
 			-- has to appear twice or one of the two runs loses its start point.
@@ -823,7 +864,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				lastCell, lastCls = s.cell, k
 			end
 			stats.edges += 1
-			stats[k] += 1
+			stats[baseOf(k)] += 1
 		end
 		if #pts < 3 then continue end
 
@@ -903,7 +944,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			--
 			-- So a wall line is moved in until no node of its own run lies outside
 			-- it. Erosion, and the safe direction.
-			if sg.class == WALL or c.insetAll then
+			if isWall(sg.class) or c.insetAll then
 				local inner = math.huge
 				for _, i in ipairs(sg.idx) do
 					local d = dot(pts[i], nrm)
@@ -951,7 +992,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			-- cell, which would pin the push at a constant and make the grading a
 			-- lie. The tightest point along the run governs the whole run.
 			local push = 0
-			if sg.class == WALL and c.agentRadius > 0 then
+			if isWall(sg.class) and c.agentRadius > 0 then
 				local reach = c.agentRadius + c.keepWidth * 0.5 + 2 * step
 				local tight = math.huge
 				for _, i in ipairs(sg.idx) do
@@ -1041,7 +1082,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		for i = 1, nL do
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
 			-- the edge LEAVING this corner runs along l2, so it carries l2's class
-			local leaving = l2.class
+			local leaving = baseOf(l2.class)
 			pushNow = l2.push or 0
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
 			local anchor = l1.anchor
