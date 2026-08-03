@@ -982,6 +982,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local verts: {P2} = {}
 		local vcls: {string} = {}
 		local vhow: {string} = {}
+		local vpush: {number} = {}
 
 		local anchorNow: P2 = { x = 0, z = 0 }
 		local function footOn(L: any, p: P2): P2
@@ -998,6 +999,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- leave the mask at a corner at all.
 		local cosStep = math.cos(math.rad(c.stepDeg))
 		local how = "cross"
+		local pushNow = 0
 		local function put(p: P2, k: string)
 			if not inMask(p.x, p.z) then
 				stats.cornersClamped += 1
@@ -1014,12 +1016,14 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			verts[#verts + 1] = p
 			vcls[#vcls + 1] = k
 			vhow[#vhow + 1] = how
+			vpush[#vpush + 1] = pushNow
 		end
 		local nL = #lines
 		for i = 1, nL do
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
 			-- the edge LEAVING this corner runs along l2, so it carries l2's class
 			local leaving = l2.class
+			pushNow = l2.push or 0
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
 			local anchor = l1.anchor
 			-- AFTER `anchor` exists. Assigned before it, this read the outer
@@ -1102,7 +1106,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			local last = stats.debug[#stats.debug]
 			last.how, last.faceVerts = vhow, verts
 		end
-		rings[#rings + 1] = { pts2 = verts, cls = vcls, area = signed2(verts) }
+		rings[#rings + 1] = { pts2 = verts, cls = vcls, push = vpush, how = vhow, area = signed2(verts) }
 	end
 
 	-- Outer is the largest by magnitude. Magnitude, never the sign: this project
@@ -1184,6 +1188,8 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 			fallback = g.fallback,
 			verts = outer.verts,
 			cls = outer.cls,
+			push = outer.push,
+			how = outer.how,
 			area = math.abs(outer.area),
 			cells = #g.cells,
 			dead = #g.dead,
@@ -1191,7 +1197,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		}
 		for _, r in ipairs(rings) do
 			if r ~= outer then
-				region.holes[#region.holes + 1] = { verts = r.verts, cls = r.cls, area = math.abs(r.area) }
+				region.holes[#region.holes + 1] = { verts = r.verts, cls = r.cls, push = r.push, how = r.how, area = math.abs(r.area) }
 			end
 		end
 		stats.verts += #region.verts
