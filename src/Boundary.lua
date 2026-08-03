@@ -59,6 +59,12 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- Pass one. `staircaseWindow` moves behind the current one decide which axis
+	-- the run travels along; `phaseLookahead` moves are allowed for travel to
+	-- resume before an unbracketed step is believed.
+	staircaseWindow: number?,
+	phaseLookahead: number?,
+
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
 	-- two meet properly.
@@ -78,6 +84,8 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
+	staircaseWindow = 6,
+	phaseLookahead = 3,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -177,6 +185,11 @@ end
 
 local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
 
+-- cardinal bits (E, N, W, S) and diagonal bits (NE, NW, SW, SE) of LocalGrid's
+-- 8-direction masks
+local CARDINALS = 1 + 4 + 16 + 64
+local DIAGONALS = 2 + 8 + 32 + 128
+
 -- lattice corners of cell (u,v)'s edge in direction di, oriented so the loop
 -- runs with the interior on its left
 local function cornersOf(u: number, v: number, di: number)
@@ -249,6 +262,78 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 		end
 	end
 	return loops
+end
+
+--------------------------------------------------------------------------
+-- PASS ONE — CORNERS, READ OFF THE STAIRCASE
+--
+-- See CORNERS.md. A wall that is not aligned to the grid it is sampled on leaves
+-- a staircase: a run of nodes that advances along one axis and occasionally
+-- steps across to the other. Which axis is which is decided by the run, never
+-- assumed, so a vertical staircase is the same object with the roles swapped.
+--
+-- The rule is that A STEP MUST BE BRACKETED BY TRAVEL. A step that is never
+-- followed by a resumption of travel was not part of the staircase, and the run
+-- ended at the last travel move -- which is the corner. This replaces counting
+-- steps: "three in a row" was a proxy for this with an arbitrary constant in it.
+--
+-- Lattice phase gets the benefit of the doubt. Two walls at the same angle half
+-- a stud apart quantise differently, so an isolated unfollowed step is suspicion
+-- rather than proof; travel is allowed a few moves to resume before the run is
+-- declared over.
+--
+-- The travel axis is taken from the moves BEHIND the current one, not from a
+-- window centred on it. A centred window straddles the corner and reports a
+-- blend of both runs, which is exactly the information the rule needs to not
+-- have.
+--------------------------------------------------------------------------
+
+local function staircaseCorners(lat: {{number}}, c: any): {boolean}
+	local n = #lat
+	local isCorner = table.create(n, false)
+	if n < 6 then return isCorner end
+
+	-- move from node i to node i+1, in lattice steps
+	local mu, mv = table.create(n, 0), table.create(n, 0)
+	for i = 1, n do
+		local j = i % n + 1
+		mu[i] = lat[j][1] - lat[i][1]
+		mv[i] = lat[j][2] - lat[i][2]
+	end
+
+	local W = math.max(2, math.floor(c.staircaseWindow))
+	local look = math.max(1, math.floor(c.phaseLookahead))
+
+	for i = 1, n do
+		-- which axis has this run been travelling along, judged from behind
+		local su, sv = 0, 0
+		for k = 1, W do
+			local j = (i - 1 - k) % n + 1
+			su += math.abs(mu[j])
+			sv += math.abs(mv[j])
+		end
+		local major = (su >= sv) and mu or mv
+		local minor = (su >= sv) and mv or mu
+
+		-- a move that advances only across the run is a step
+		if major[i] == 0 and minor[i] ~= 0 then
+			local resumed = false
+			for k = 1, look do
+				if major[(i - 1 + k) % n + 1] ~= 0 then resumed = true; break end
+			end
+			if not resumed then
+				-- the run ended at the last move that actually travelled
+				for k = 0, n - 1 do
+					local j = (i - 1 - k) % n + 1
+					if major[j] ~= 0 then
+						isCorner[j % n + 1] = true
+						break
+					end
+				end
+			end
+		end
+	end
+	return isCorner
 end
 
 --------------------------------------------------------------------------
@@ -719,21 +804,63 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- the duplicate carries no information, so collapse it.
 		local pts: {P2} = {}
 		local cls: {string} = {}
+		local owner: {any} = {}
+		local lat: {{number}} = {}
 		local lastCell, lastCls = nil, nil
+		local function pushNode(cell: any, k: string)
+			pts[#pts + 1] = { x = (cell.ui + 0.5) * step, z = (cell.vi + 0.5) * step }
+			cls[#cls + 1] = k
+			owner[#owner + 1] = cell
+			lat[#lat + 1] = { cell.ui, cell.vi }
+		end
 		for _, s in ipairs(loop) do
 			local k = classOf(g, s)
 			-- Collapse the duplicate a corner cell contributes, but ONLY while the
 			-- class holds: a cell with a wall on one side and a seam on the other
 			-- has to appear twice or one of the two runs loses its start point.
 			if s.cell ~= lastCell or k ~= lastCls then
-				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
-				cls[#cls + 1] = k
+				-- THE APEX OF A DIAGONAL TURN IS NOT ON THE RING. Where solid
+				-- touches the floor only at its corner, the cell at the inside of
+				-- the turn has all four cardinals clear -- only a diagonal blocked
+				-- -- so a 4-connected trace walks straight past it. Measured, 357
+				-- of 6046 boundary nodes are in that position, and they include
+				-- corners marked by hand. The ring has to go through the turn, not
+				-- around it, or those corners cannot be found by any rule.
+				if lastCell then
+					local du = s.cell.ui - lastCell.ui
+					local dv = s.cell.vi - lastCell.vi
+					if math.abs(du) == 1 and math.abs(dv) == 1 then
+						local a = g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)]
+						local b = g.index[(lastCell.ui + du) .. ":" .. lastCell.vi]
+						local function pureDiagonal(cand): boolean
+							if not cand then return false end
+							local blk = bit32.bor(cand.wallMask or 0, cand.dropMask or 0)
+							return bit32.band(blk, CARDINALS) == 0
+								and bit32.band(blk, DIAGONALS) ~= 0
+						end
+						local tip = pureDiagonal(a) and a or (pureDiagonal(b) and b or nil)
+						if tip and tip ~= s.cell and tip ~= lastCell then
+							pushNode(tip, k)
+							stats.apexNodes += 1
+						end
+					end
+				end
+				pushNode(s.cell, k)
 				lastCell, lastCls = s.cell, k
 			end
 			stats.edges += 1
 			stats[k] += 1
 		end
 		if #pts < 3 then continue end
+
+		-- PASS ONE: corners, read off the staircase, before any line is fitted.
+		local corner = staircaseCorners(lat, c)
+		for i = 1, #corner do
+			if corner[i] and owner[i] then
+				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
+				owner[i].edgeCorner = true
+			end
+		end
 
 		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
 		-- and the old implementation hit it on 165 of 169 holes: the two long
@@ -1012,6 +1139,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
 		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
+		edgeCorners = 0, apexNodes = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
