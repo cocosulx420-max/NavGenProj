@@ -86,6 +86,22 @@ check absorbs.
 
 ### A junction is a question, not an answer
 
+**Measured on SmallMap: 0 of 8116 lattice vertices have more than one boundary
+edge starting at them, so the trace there does not branch at all.** That is not
+grounds for deleting this section. SmallMap is a clean, deliberately simple map
+built to prove the concept; it is not evidence about what the boundary looks like
+on a large, messy, vertical one.
+
+The mechanism is real and has been measured before. In the world-raster pipeline
+a cliff *inside* a traced set emitted a boundary edge from each side, producing
+zero-width slits whose ends are lattice vertices with four edges leaving them --
+1146 such adjacencies on this same map. Per-part block grids are single planes,
+so they cannot produce one. **Fallback grids can**: a Union or MeshPart floor
+carrying two surfaces at different heights has a cliff inside its own grid, and
+that is the slit. SmallMap has two Union parts. A complex map will have many.
+
+So this stays, and it stays untested until there is a map that exercises it.
+
 A **junction** is a node where the rim offers more than one continuation. It does
 not end the run by itself. It means: *more than one thing continues here, go find
 out which of them is my staircase, if any.*
@@ -146,6 +162,25 @@ From DESIGN.md, unchanged:
 - **Never ask a Part anything.** No CFrames, no face planes, no sizes, no
   raycasts, no overlap queries. Every rule above reads cell data only.
 - **Erosion only.** Ground may be given up, never invented.
+
+## Risks to measure, not to reason about
+
+Three things this design could plausibly get wrong. None is settled by argument;
+each needs a bake on a map that contains the case.
+
+- **Curves may shatter.** The rules rest on a stepping rate, and a curved wall's
+  rate changes continuously -- 5 travels, then 3, then 2, then 1. The phase
+  lookahead could read that as a turn at every step and break a smooth curve into
+  micro-segments. The crescent-shaped Union on SmallMap is the nearest test case;
+  a real map will have far worse.
+- **Single-cell noise may fake a corner.** One missing or offset cell on an
+  otherwise straight wall creates an unbracketed step. Systematic dropouts of
+  this kind existed until the leaf-clipped down-ray in `Floor` was fixed, so the
+  noise floor is lower than it was, but isolated artefacts have not been counted.
+  Telling one-cell noise from a shallow angle change by pattern alone is the
+  brittlest part of this design.
+- **Junctions are unexercised.** See above: the handling is specified but nothing
+  on SmallMap triggers it, so it is unverified code until a messy map runs.
 
 ## Open questions
 
