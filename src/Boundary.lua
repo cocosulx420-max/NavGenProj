@@ -67,6 +67,11 @@ export type Config = {
 	-- Fit-quality tiebreak. `cornerSplitSpan` nodes either side are fitted to
 	-- decide which candidate splits the boundary most cleanly; a split has to
 	-- beat its rival by `cornerSplitTol` to win on that alone.
+	-- Check each candidate extension's chord against the solid cells before
+	-- accepting it, so a run cannot grow across masonry while every node it holds
+	-- still fits its line.
+	verifyGrowth: boolean?,
+
 	cornerSplitSpan: number?,
 	cornerSplitTol: number?,
 
@@ -99,6 +104,7 @@ local DEFAULT = {
 	-- span nodes and a second window only blurs corners into their neighbours.
 	cornerWindow = 1,
 	cornerAngle = 35,
+	verifyGrowth = true,
 	cornerSplitSpan = 4,
 	cornerSplitTol = 0.05,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
@@ -469,7 +475,7 @@ end
 -- against real geometry instead.
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any, corner: {boolean}?)
+local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any, corner: {boolean}?, blocked: ((P2, P2) -> boolean)?)
 	local n = #pts
 	local segs: {any} = {}
 	if n < 2 then return segs end
@@ -566,9 +572,26 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any, corner:
 		local trial = table.clone(cur)
 		trial[#trial + 1] = i
 		local cen, dir = fitLine(pts, trial)
+		-- VERIFY THE EDGE BEFORE ACCEPTING THE NODE.
+		--
+		-- The residual says the line follows its nodes. It says nothing about what
+		-- the line CROSSES. A run growing around a concave bend can hold every
+		-- node inside tolerance while the chord between its ends cuts straight
+		-- through masonry -- that is not a fitting error, it is a visibility one,
+		-- and no tightening of the residual can see it.
+		--
+		-- So each candidate extension is checked the way a raycast would check it,
+		-- but against the solid cells the grid already knows from wallMask rather
+		-- than against real geometry. If the chord from the run's start to its new
+		-- end crosses solid, the run stops here instead of swallowing the node.
+		local crosses = false
+		if blocked and #trial >= 2 then
+			crosses = blocked(pts[trial[1]], pts[trial[#trial]])
+			if crosses then stats.growthBlocked += 1 end
+		end
 		-- MAXIMUM residual, never the average: an average lets a shallow corner
 		-- hide inside a long run, which is precisely the corner worth keeping.
-		local fails = reversed or maxResidual(pts, trial, cen, dir) > c.fitTol
+		local fails = reversed or crosses or maxResidual(pts, trial, cen, dir) > c.fitTol
 
 		if fails then
 			-- A BREAK MUST EARN ITSELF -- BUT THE FIT COMES FIRST.
@@ -1031,7 +1054,20 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				owner[i].edgeCorner = true
 			end
 		end
-		local rawSegs = segmentLoop(pts, c, cls, stats, corner)
+		-- a chord crosses solid if any sample along it lands on a solid cell
+		local function chordBlocked(a: P2, b: P2): boolean
+			local dx, dz = b.x - a.x, b.z - a.z
+			local L = math.sqrt(dx * dx + dz * dz)
+			if L < 1e-6 then return false end
+			local steps = math.clamp(math.floor(L / (step * 0.5)), 2, 200)
+			for k = 0, steps do
+				local t = k / steps
+				if isSolid(a.x + dx * t, a.z + dz * t) then return true end
+			end
+			return false
+		end
+		local rawSegs = segmentLoop(pts, c, cls, stats, corner,
+			c.verifyGrowth and chordBlocked or nil)
 		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
 
@@ -1298,7 +1334,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, edgeCorners = 0, apexNodes = 0,
+		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, edgeCorners = 0, apexNodes = 0, growthBlocked = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
