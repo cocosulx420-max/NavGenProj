@@ -64,6 +64,12 @@ export type Config = {
 	cornerWindow: number?,
 	cornerAngle: number?,
 
+	-- Fit-quality tiebreak. `cornerSplitSpan` nodes either side are fitted to
+	-- decide which candidate splits the boundary most cleanly; a split has to
+	-- beat its rival by `cornerSplitTol` to win on that alone.
+	cornerSplitSpan: number?,
+	cornerSplitTol: number?,
+
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
 	-- two meet properly.
@@ -91,6 +97,8 @@ local DEFAULT = {
 	-- so 20 sits in the middle of the plateau rather than on its edge.
 	cornerWindow = 1,
 	cornerAngle = 20,
+	cornerSplitSpan = 4,
+	cornerSplitTol = 0.05,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
 	cornerSpan = 0,
 	cornerDeg = 45,
@@ -337,7 +345,7 @@ local function isApexCell(cell: any): boolean
 	return bit32.band(blocked, CARDINALS) == 0 and bit32.band(blocked, DIAGONALS) ~= 0
 end
 
-local function findCorners(nrm: {P2}, owner: {any}, c: any): {boolean}
+local function findCorners(pts: {P2}, nrm: {P2}, owner: {any}, c: any): {boolean}
 	local n = #nrm
 	local isCorner = table.create(n, false)
 	if n < 5 then return isCorner end
@@ -374,8 +382,39 @@ local function findCorners(nrm: {P2}, owner: {any}, c: any): {boolean}
 	local apex = table.create(n, false)
 	for i = 1, n do apex[i] = isApexCell(owner[i]) end
 	local lim = c.cornerAngle
+
+	-- HOW WELL DOES THE BOUNDARY SPLIT HERE.
+	--
+	-- Where no apex settles it -- a staircased rim has no cell touching solid on
+	-- a diagonal alone -- the question is still which of two or three neighbours
+	-- is the corner, and swing size cannot answer it because the wobble is the
+	-- same size as the turn.
+	--
+	-- But a corner is defined by what it separates. Cut the ring at a node, fit a
+	-- line to the run either side, and the true corner is the cut where BOTH
+	-- lines fit their nodes best: cut one node early and the first line has to
+	-- swallow a node belonging to the second, which shows up immediately as
+	-- residual. Cutting at the corner costs nothing; cutting beside it costs.
+	local span = math.max(2, math.floor(c.cornerSplitSpan))
+	local splitCost = table.create(n, 0)
+	do
+		local ia, ib = table.create(span + 1, 0), table.create(span + 1, 0)
+		for i = 1, n do
+			for k = 0, span do
+				ia[k + 1] = (i - 1 - span + k) % n + 1
+				ib[k + 1] = (i - 1 + k) % n + 1
+			end
+			local ca, da = fitLine(pts, ia)
+			local cb, db = fitLine(pts, ib)
+			splitCost[i] = math.max(maxResidual(pts, ia, ca, da), maxResidual(pts, ib, cb, db))
+		end
+	end
+
 	local function outranks(j: number, i: number): boolean
 		if apex[j] ~= apex[i] then return apex[j] end
+		-- a clearly better split wins; near-equal splits fall through to the swing
+		if splitCost[j] < splitCost[i] - c.cornerSplitTol then return true end
+		if splitCost[i] < splitCost[j] - c.cornerSplitTol then return false end
 		if turn[j] ~= turn[i] then return turn[j] > turn[i] end
 		return j < i
 	end
@@ -967,7 +1006,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
 		-- corners first, from the ground; the fit is told where they are
-		local corner = findCorners(nrm, owner, c)
+		local corner = findCorners(pts, nrm, owner, c)
 		for i = 1, #corner do
 			if corner[i] and owner[i] then
 				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
