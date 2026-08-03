@@ -397,6 +397,21 @@ local function findCorners(pts: {P2}, nrm: {P2}, owner: {any}, c: any): {boolean
 	-- residual. Cutting at the corner costs nothing; cutting beside it costs.
 	local span = math.max(2, math.floor(c.cornerSplitSpan))
 	local splitCost = table.create(n, 0)
+	-- THE TURN THAT DECIDES A CORNER IS THE TURN BETWEEN THE LINES, not between
+	-- the normals.
+	--
+	-- A node's normal is quantised to eight directions, so along a staircased rim
+	-- it swings 45 degrees between neighbours on ground that is perfectly
+	-- straight. To catch real corners through that the threshold had to come down
+	-- to 20 degrees, and at 20 degrees the wobble itself qualifies: 202 of 692
+	-- detected corners sat in a neighbourhood with no bend in it at all, and 123
+	-- more were near enough straight.
+	--
+	-- The lines either side are already being fitted here for the tiebreak, and
+	-- the angle between THEM is the real turn -- averaged over span nodes, so the
+	-- quantisation cancels instead of dominating. A straight staircase gives
+	-- nearly zero however jagged it looks; a corner gives its actual angle.
+	local fitTurn = table.create(n, 0)
 	do
 		local ia, ib = table.create(span + 1, 0), table.create(span + 1, 0)
 		for i = 1, n do
@@ -407,6 +422,7 @@ local function findCorners(pts: {P2}, nrm: {P2}, owner: {any}, c: any): {boolean
 			local ca, da = fitLine(pts, ia)
 			local cb, db = fitLine(pts, ib)
 			splitCost[i] = math.max(maxResidual(pts, ia, ca, da), maxResidual(pts, ib, cb, db))
+			fitTurn[i] = math.deg(math.acos(math.clamp(dot(da, db), -1, 1)))
 		end
 	end
 
@@ -415,18 +431,18 @@ local function findCorners(pts: {P2}, nrm: {P2}, owner: {any}, c: any): {boolean
 		-- a clearly better split wins; near-equal splits fall through to the swing
 		if splitCost[j] < splitCost[i] - c.cornerSplitTol then return true end
 		if splitCost[i] < splitCost[j] - c.cornerSplitTol then return false end
-		if turn[j] ~= turn[i] then return turn[j] > turn[i] end
+		if fitTurn[j] ~= fitTurn[i] then return fitTurn[j] > fitTurn[i] end
 		return j < i
 	end
 	for i = 1, n do
-		if turn[i] >= lim then
+		if fitTurn[i] >= lim then
 			local best = true
 			for k = -w, w do
 				if k ~= 0 then
 					local j = (i - 1 + k) % n + 1
 					-- a neighbour only suppresses this node if it is itself a
 					-- candidate; a quiet node cannot veto a corner
-					if turn[j] >= lim and outranks(j, i) then best = false; break end
+					if fitTurn[j] >= lim and outranks(j, i) then best = false; break end
 				end
 			end
 			isCorner[i] = best
