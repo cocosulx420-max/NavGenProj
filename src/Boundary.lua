@@ -952,7 +952,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			-- lie. The tightest point along the run governs the whole run.
 			local push = 0
 			if sg.class == WALL and c.agentRadius > 0 then
-				local reach = c.agentRadius + c.margin + 2 * step
+				local reach = c.agentRadius + c.keepWidth * 0.5 + 2 * step
 				local tight = math.huge
 				for _, i in ipairs(sg.idx) do
 					local best = 0
