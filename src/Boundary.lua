@@ -751,6 +751,21 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local rawSegs = segmentLoop(pts, c, cls, stats)
 		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
+
+		-- WHERE AN EDGE BEGINS IS A CORNER, and nothing else is.
+		--
+		-- Not a geometric property of a node: a long straight wall at 45 degrees
+		-- has every node turning against the lattice and not one of them is a
+		-- corner of the drawn boundary. What matters is where the fit decided one
+		-- line had to stop and the next start, which is exactly a run's first
+		-- node. Marked back onto the cell so the node viz can shade it.
+		for _, sg in ipairs(segs) do
+			local cell = owner[sg.idx[1]]
+			if cell then
+				if not cell.edgeCorner then stats.edgeCorners += 1 end
+				cell.edgeCorner = true
+			end
+		end
 		if c.debugPart and g.part == c.debugPart then
 			local function snap(list)
 				local out = {}
