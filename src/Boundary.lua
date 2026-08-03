@@ -59,6 +59,12 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- STEP 6. The inward offset, applied to WALL runs only. `agentRadius` is how
+	-- far a body must stay off masonry; `margin` is how much ground must remain
+	-- behind the line before any of it is given up.
+	agentRadius: number?,
+	margin: number?,
+
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
 	-- two meet properly.
@@ -83,6 +89,8 @@ local DEFAULT = {
 	maxGap = 3.0,
 	mergeNeedsFit = false,
 	insetAll = true,
+	agentRadius = 1.5,
+	margin = 0.5,
 }
 
 local function merged(cfg): any
@@ -160,6 +168,57 @@ local function maxResidual(pts: {P2}, idx: {number}, c: P2, d: P2): number
 		if r > worst then worst = r end
 	end
 	return worst
+end
+
+--------------------------------------------------------------------------
+-- TRUE EUCLIDEAN DISTANCE TRANSFORM (Felzenszwalb & Huttenlocher)
+--
+-- It must be TRUE Euclidean. Stepping over 4-neighbours gives a diamond kernel
+-- and 8-neighbours a square one, so an offset derived from either comes out
+-- wrong on the diagonals -- which is exactly where the rotated walls are.
+--------------------------------------------------------------------------
+
+local INF = 1e20
+
+local function edt1d(f: {number}, n: number): {number}
+	local v, z, d = table.create(n, 0), table.create(n + 1, 0), table.create(n, 0)
+	local k = 1
+	v[1] = 1; z[1] = -INF; z[2] = INF
+	for q = 2, n do
+		local s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k])
+		while s <= z[k] do
+			k -= 1
+			s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k])
+		end
+		k += 1; v[k] = q; z[k] = s; z[k + 1] = INF
+	end
+	k = 1
+	for q = 1, n do
+		while z[k + 1] < q do k += 1 end
+		local dq = q - v[k]
+		d[q] = dq * dq + f[v[k]]
+	end
+	return d
+end
+
+-- `inside(i, j)` over a w x h raster -> squared distance to the nearest cell
+-- that is NOT inside.
+local function edt2d(w: number, h: number, inside: (number, number) -> boolean): {number}
+	local g = table.create(w * h, 0)
+	local col = table.create(h, 0)
+	for i = 1, w do
+		for j = 1, h do col[j] = inside(i, j) and INF or 0 end
+		local d = edt1d(col, h)
+		for j = 1, h do g[(j - 1) * w + i] = d[j] end
+	end
+	local row = table.create(w, 0)
+	for j = 1, h do
+		local base = (j - 1) * w
+		for i = 1, w do row[i] = g[base + i] end
+		local d = edt1d(row, w)
+		for i = 1, w do g[base + i] = d[i] end
+	end
+	return g
 end
 
 --------------------------------------------------------------------------
@@ -703,6 +762,30 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
 	end
 
+	-- GROUND THICKNESS, for the graded offset. Distance from every live cell to
+	-- the nearest cell that is not live, true Euclidean, built once per grid and
+	-- only when something will ask for it.
+	local dfield, dlo_u, dlo_v, dw, dh
+	local function distAt(a: number, b: number): number
+		if not dfield then
+			local lu, hu, lv, hv = math.huge, -math.huge, math.huge, -math.huge
+			for _, cell in ipairs(g.cells) do
+				lu = math.min(lu, cell.ui); hu = math.max(hu, cell.ui)
+				lv = math.min(lv, cell.vi); hv = math.max(hv, cell.vi)
+			end
+			-- one cell of padding, so the transform sees open space beyond the rim
+			dlo_u, dlo_v = lu - 1, lv - 1
+			dw, dh = (hu - lu) + 3, (hv - lv) + 3
+			dfield = edt2d(dw, dh, function(i, j)
+				return g.index[(dlo_u + i - 1) .. ":" .. (dlo_v + j - 1) .. ""] ~= nil
+			end)
+		end
+		local iu = math.floor(a / step) - dlo_u + 1
+		local iv = math.floor(b / step) - dlo_v + 1
+		if iu < 1 or iv < 1 or iu > dw or iv > dh then return 0 end
+		return math.sqrt(dfield[(iv - 1) * dw + iu]) * step
+	end
+
 	local cliff = nil
 	if not isBlock then
 		cliff = function(a: any, b: any): boolean
@@ -838,9 +921,52 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				local mean = math.abs(acc / #sg.idx)
 				if mean > stats.worstLean then stats.worstLean = mean end
 			end
+			-- STEP 6 — THE GRADED INWARD OFFSET, WALLS ONLY.
+			--
+			-- A dropoff is not offset at all: an agent may walk the lip of a
+			-- ledge, and standing off from every one of them cost 12.4% of this
+			-- map's cells at exactly its narrowest places. A seam is not offset
+			-- either -- the floor genuinely continues onto another grid there, so
+			-- pulling back would open a gap between two surfaces that touch.
+			--
+			-- The push is clamp(maxD - margin, 0, agentRadius), GRADED rather than
+			-- switched. A hard "skip the offset when the corridor is narrow" makes
+			-- two adjacent runs straddling the threshold offset by r and by 0, so
+			-- they stop sharing an edge; grading is continuous and a 2-stud
+			-- corridor keeps its walkable width instead of vanishing.
+			--
+			-- maxD is the thickness of the ground BEHIND the line, and it has to
+			-- be found by marching inward. Reading the distance transform at the
+			-- boundary nodes themselves is worthless: a boundary node is adjacent
+			-- to a non-live cell by construction, so its distance is always one
+			-- cell, which would pin the push at a constant and make the grading a
+			-- lie. The tightest point along the run governs the whole run.
+			local push = 0
+			if sg.class == WALL and c.agentRadius > 0 then
+				local reach = c.agentRadius + c.margin + 2 * step
+				local tight = math.huge
+				for _, i in ipairs(sg.idx) do
+					local best = 0
+					local t = step * 0.5
+					while t <= reach do
+						local d = distAt(pts[i].x - nrm.x * t, pts[i].z - nrm.z * t)
+						if d > best then best = d end
+						t += step * 0.5
+					end
+					if best < tight then tight = best end
+				end
+				if tight < math.huge then
+					push = math.clamp(tight - c.margin, 0, c.agentRadius)
+					stats.offsetSum += push
+					if push < stats.offsetMin then stats.offsetMin = push end
+					if push > stats.offsetMax then stats.offsetMax = push end
+					stats.wallRuns += 1
+				end
+			end
+
 			lines[#lines + 1] = {
-				n = nrm, c = cval, cen = sg.cen, dir = sg.dir,
-				anchor = pts[sg.idx[#sg.idx]], class = sg.class,
+				n = nrm, c = cval - push, cen = sg.cen, dir = sg.dir,
+				anchor = pts[sg.idx[#sg.idx]], class = sg.class, push = push,
 			}
 		end
 
@@ -1012,6 +1138,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
 		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
+		wallRuns = 0, offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
@@ -1050,6 +1177,8 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		regions[#regions + 1] = region
 	end
 
+	if stats.offsetMin == math.huge then stats.offsetMin = 0 end
+	stats.offsetMean = (stats.wallRuns > 0) and (stats.offsetSum / stats.wallRuns) or 0
 	stats.seconds = os.clock() - t0
 	return { regions = regions, stats = stats, config = c }
 end
