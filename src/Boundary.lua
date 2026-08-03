@@ -65,10 +65,13 @@ export type Config = {
 	stepDeg: number?,
 
 	-- STEP 6. The inward offset, applied to WALL runs only. `agentRadius` is how
-	-- far a body must stay off masonry; `margin` is how much ground must remain
-	-- behind the line before any of it is given up.
+	-- far a body must stay off masonry.
 	agentRadius: number?,
-	margin: number?,
+
+	-- The corridor width that is never eaten. BOTH walls of a corridor push
+	-- inward, so the budget has to be the width that survives them both, not the
+	-- ground behind one line -- see the note on the offset itself.
+	keepWidth: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -96,7 +99,7 @@ local DEFAULT = {
 	insetAll = true,
 	stepDeg = 30,
 	agentRadius = 1.5,
-	margin = 0.5,
+	keepWidth = 2.0,
 }
 
 local function merged(cfg): any
@@ -962,7 +965,23 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					if best < tight then tight = best end
 				end
 				if tight < math.huge then
-					push = math.clamp(tight - c.margin, 0, c.agentRadius)
+					-- BOTH WALLS OF A CORRIDOR PUSH INWARD, so the budget is the
+					-- width that survives both of them. `tight` is the half-width
+					-- here, so a corridor of width W keeps W - 2*push; requiring
+					-- that to stay at or above keepWidth gives push <= tight -
+					-- keepWidth/2, and nothing narrower than keepWidth is touched
+					-- at all.
+					--
+					-- Budgeting one side's ground instead -- push = maxD - margin --
+					-- looks similar and is not: with margin 0.5 it left EVERY
+					-- corridor up to 4 studs wide at exactly 1.00 stud. A 2-stud
+					-- corridor lost half its width, a 3-stud lost two thirds, and
+					-- 17 of this map's 92 wall edges sit in corridors under 4 studs.
+					--
+					-- Still graded, not switched: the push rises continuously from
+					-- zero at keepWidth, so two adjacent runs either side of the
+					-- threshold do not offset by r and by 0 and stop sharing an edge.
+					push = math.clamp(tight - c.keepWidth * 0.5, 0, c.agentRadius)
 					stats.offsetSum += push
 					if push < stats.offsetMin then stats.offsetMin = push end
 					if push > stats.offsetMax then stats.offsetMax = push end
