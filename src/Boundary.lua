@@ -59,11 +59,13 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
-	-- Pass one. `staircaseWindow` moves decide which axis a run travels along and
-	-- how far ahead a step looks for travel to continue; the run ends when less
-	-- than `travelFloor` of that window is travel.
+	-- Pass one. `staircaseWindow` moves decide which axis a run travels along --
+	-- that is all it does now. The run then ends on a travel reversal, a step
+	-- reversal, or a node sitting more than `driftTol` cells off the heading the
+	-- run has averaged so far. The first two are exact; `driftTol` is the only
+	-- tolerance in pass one.
 	staircaseWindow: number?,
-	travelFloor: number?,
+	driftTol: number?,
 
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
@@ -85,7 +87,7 @@ local DEFAULT = {
 	collinearDeg = 20,
 	miterLimit = 6.0,
 	staircaseWindow = 6,
-	travelFloor = 0.4,
+	driftTol = 1.0,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -279,14 +281,40 @@ end
 -- and a false corner appeared two nodes later once the backward window had
 -- filled with the new run's moves. One fault, both symptoms.
 --
--- What distinguishes them is not whether the axis twitches but how OFTEN. Before
--- that turn the run was pure travel -- no steps at all. After it, five steps in
--- six moves along the same axis. The axis is unchanged; the character is not.
+-- READING THE PATTERN IS A DEAD END, AND THIS IS THE THIRD TIME IT FAILED.
 --
--- So a run is established, its stepping RATE measured, and the run ends when the
--- rate changes sharply. Rate is also what survives the sub-cell offset that makes
--- two walls at the same angle quantise differently, which is why CORNERS.md
--- insists rules be stated in terms of it.
+-- Counting steps, then bracketing steps, then measuring a stepping RATE. Each
+-- looked structurally right and two measured as outright regressions. They share
+-- one premise: that the arrangement of steps identifies the wall. It does not.
+-- Two identical walls half a stud apart quantise differently, and an irregular
+-- staircase is still a staircase -- so any rule reading cadence disagrees with
+-- itself across a sub-cell offset, and the tolerance that hides the disagreement
+-- also hides real turns. There is one knob and it trades recall against
+-- precision monotonically.
+--
+-- THREE RULES, TWO OF THEM EXACT.
+--
+-- 1. TRAVEL SIGN IS FIXED. A horizontal run goes left or right, never both.
+-- 2. STEP SIGN IS FIXED. Its steps go up or down, never both.
+-- 3. The run may not DRIFT from its own average heading.
+--
+-- The first two need no tolerance, so they are checked first -- a reversal is
+-- proof, and there is no reason to let a threshold weigh in on something already
+-- decided. Rule 3 is the only tolerance in pass one and exists solely for the
+-- rim that turns WITHOUT reversing, which is the shallow-angle case.
+--
+-- Rule 1 is not a formality. DESIGN.md step 4 records it discovered from the
+-- other side, as a bug: rounding the end of a thin strip brings the walk back
+-- down the other side, every returning cell sits within tolerance of the line it
+-- just left, so the residual NEVER fails -- 36 of SmallMap's step parts collapsed
+-- entirely until a travel-direction test was added in pass two. Drift alone is
+-- blind to every one of those. It is cheaper to catch here.
+--
+-- THE TRIGGER IS NOT THE CORNER. All three rules only answer "the run is over".
+-- None of them says where the corner is: the corner is the LAST TRAVEL MOVE,
+-- walked back to. This is the whole difference from the fit-failure corners
+-- CORNERS.md rejects, which let the residual failure BE the corner and so landed
+-- a node early and left a chamfer in the crook. On a skim the two look alike.
 --------------------------------------------------------------------------
 
 local function staircaseCorners(lat: {{number}}, c: any): {boolean}
@@ -302,6 +330,11 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	end
 
 	local W = math.max(3, math.floor(c.staircaseWindow))
+	local tol = c.driftTol
+
+	local function sgn(x: number): number
+		return (x > 0) and 1 or ((x < 0) and -1 or 0)
+	end
 
 	-- Walk from `start` until every move on the ring has been consumed.
 	--
@@ -317,9 +350,10 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 		local visited = table.create(n, false)
 		local i, consumed = start, 0
 		while consumed < n do
-			-- Establish the run: which axis it travels along and how often it
-			-- steps, from the moves AHEAD of the corner it starts at. Behind is
-			-- the previous run, which is exactly what must not be read.
+			-- Establish the run's AXIS -- only the axis -- from the moves AHEAD of
+			-- the corner it starts at. Behind is the previous run, which is exactly
+			-- what must not be read. Nothing about cadence is taken from here; the
+			-- window's whole job is deciding horizontal versus vertical.
 			local su, sv = 0, 0
 			for k = 0, W - 1 do
 				local j = (i - 1 + k) % n + 1
@@ -327,48 +361,66 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				sv += math.abs(mv[j])
 			end
 			local major = (su >= sv) and mu or mv
+			local minor = (su >= sv) and mv or mu
 
-			-- Follow it while travel keeps coming.
+			-- Follow it under the three rules. Signs latch on first sight rather
+			-- than being taken from the window, because the window is there to name
+			-- the AXIS and a window wide enough to do that reliably may already
+			-- straddle the corner behind us.
 			--
-			-- A STEP IS BRACKETED IF TRAVEL IS STILL MOSTLY WHAT FOLLOWS IT.
+			-- Drift is measured against the run's own average heading, anchored at
+			-- the running centroid of its nodes. Chord (last minus first) was the
+			-- obvious alternative and is wrong for the same reason CORNERS.md gives
+			-- for maximum-vs-average residual: a chord is pinned to two endpoints
+			-- and a shallow bend between them moves it barely at all.
 			--
-			-- Two weaker tests were tried first and both are recorded here because
-			-- each failed for a reason worth not repeating.
-			--
-			-- "Does the travel axis move again within a few?" forgives every turn
-			-- into a staircase, because the new staircase's steps lie along the old
-			-- run's travel axis -- so the axis does keep twitching, once every five
-			-- or six moves, and the turn is never seen.
-			--
-			-- Comparing the run's recent stepping rate against its own history
-			-- fixes that, but needs roughly two windows of run before it may speak.
-			-- Instrumented at the corner Cocosulx labelled: axis correct, recent
-			-- 0.17, history 0.00 -- and one single move of history, so the test was
-			-- not allowed to fire at all. Runs between real corners are routinely
-			-- shorter than the evidence that test demands.
-			--
-			-- Looking FORWARD needs no history. After a step, ask what the next few
-			-- moves are made of: on a straight staircase they are overwhelmingly
-			-- travel, five or six to the one step. Past a turn they are not --
-			-- beyond that corner only one move in six is travel on the old axis,
-			-- because the run now travels along the other one. Same window, no
-			-- warm-up, and it works on a run six moves long.
+			-- A diagonal move advances BOTH axes, so it is judged on both -- it is a
+			-- travel and a step at once, never invisible. That is what put case2 out
+			-- of reach of every step-pattern test: its rim turns via a diagonal and
+			-- so never registered a step to bracket.
 			local lastTravel: number? = nil
+			local tSign, sSign = 0, 0
+			local hu, hv = 0.0, 0.0		-- summed move vector: average heading
+			local cu, cv = lat[i][1] + 0.0, lat[i][2] + 0.0	-- centroid accumulator
+			local cn = 1
 			local j, moved = i, 0
 			while moved < n do
-				if major[j] ~= 0 then
-					lastTravel = j
-				else
-					-- a step: is travel still what mostly follows?
-					local ahead = 0
-					for k = 1, W do
-						if major[(j - 1 + k) % n + 1] ~= 0 then ahead += 1 end
-					end
-					if ahead / W < c.travelFloor then break end
+				local dMaj, dMin = major[j], minor[j]
+
+				-- rule 1 and rule 2, exact
+				if dMaj ~= 0 then
+					local s = sgn(dMaj)
+					if tSign == 0 then tSign = s elseif s ~= tSign then break end
 				end
-				j = j % n + 1
+				if dMin ~= 0 then
+					local s = sgn(dMin)
+					if sSign == 0 then sSign = s elseif s ~= sSign then break end
+				end
+
+				local nxt = j % n + 1
+
+				-- rule 3, the one tolerance: how far the incoming node sits off the
+				-- heading this run has averaged so far. Needs a heading to test
+				-- against, so it stays quiet until the run has two moves in it.
+				if cn >= 2 then
+					local hl = math.sqrt(hu * hu + hv * hv)
+					if hl > 1e-9 then
+						local ax, az = cu / cn, cv / cn
+						local du = lat[nxt][1] - ax
+						local dv = lat[nxt][2] - az
+						local perp = math.abs(du * (hv / hl) - dv * (hu / hl))
+						if perp > tol then break end
+					end
+				end
+
+				if dMaj ~= 0 then lastTravel = j end
+
+				hu += mu[j]; hv += mv[j]
+				cu += lat[nxt][1]; cv += lat[nxt][2]; cn += 1
+				j = nxt
 				moved += 1
-			end			-- The run owns the moves up to its last travelling one; anything past
+			end
+			-- The run owns the moves up to its last travelling one; anything past
 			-- that belongs to whatever comes next and must not be consumed here,
 			-- or the following run starts mid-stride and never establishes an axis.
 			local stop = lastTravel or j
