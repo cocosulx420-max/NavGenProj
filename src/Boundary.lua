@@ -83,12 +83,14 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
-	-- Swept against 51 corners Cocosulx marked by hand, matched node for node.
-	-- Window 2 peaks at 30; window 1 gets 22 and window 4 gets 23. The angle
-	-- hardly matters between 20 and 30, which says what is left is not the
-	-- threshold but WHICH node of a wobbling staircased rim wins the comparison.
-	cornerWindow = 2,
-	cornerAngle = 25,
+	-- Swept against the corners Cocosulx marked by hand, matched node for node.
+	-- Once the tie is broken by structure rather than by swing size, window 1
+	-- wins clearly -- 41 of 50 exact against 36 at window 2 -- because a window
+	-- exists to smooth wobble and the apex rule no longer needs protecting from
+	-- it. The angle is flat anywhere from 10 to 22 and falls off a cliff at 25,
+	-- so 20 sits in the middle of the plateau rather than on its edge.
+	cornerWindow = 1,
+	cornerAngle = 20,
 	-- corners are explicit now, so nothing needs deleting to tidy up after them
 	cornerSpan = 0,
 	cornerDeg = 45,
