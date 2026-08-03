@@ -187,6 +187,12 @@ end
 
 local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
 
+-- LocalGrid's 8 directions, in the order its bitmasks use
+local DIR8 = {
+	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+}
+
 -- lattice corners of cell (u,v)'s edge in direction di, oriented so the loop
 -- runs with the interior on its left
 local function cornersOf(u: number, v: number, di: number)
@@ -713,6 +719,38 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
 	end
 
+	-- WHERE THE SOLID IS.
+	--
+	-- Off the mask is not the same as inside something. A boundary that runs a
+	-- little past the cells onto a neighbouring part's floor has crossed a seam,
+	-- which is harmless; a boundary that runs into masonry has crossed a wall,
+	-- which is not. Only the second is worth eroding ground to avoid.
+	--
+	-- LocalGrid already recorded which of a node's 8 directions have something
+	-- standing in them, so the solid cells are exactly the neighbours a wall node
+	-- points at. Cell data, no part consulted.
+	local solid: {[string]: boolean}? = nil
+	local function isSolid(a: number, b: number): boolean
+		if not solid then
+			solid = {}
+			for _, cell in ipairs(g.cells) do
+				local mask = cell.wallMask
+				if mask and mask ~= 0 then
+					for bit = 1, 8 do
+						if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
+							local d = DIR8[bit]
+							local k = (cell.ui + d[1]) .. ":" .. (cell.vi + d[2])
+							-- a cell that is itself walkable is not solid, whatever a
+							-- neighbour thinks it can see in that direction
+							if not g.index[k] then (solid :: any)[k] = true end
+						end
+					end
+				end
+			end
+		end
+		return (solid :: any)[math.floor(a / step) .. ":" .. math.floor(b / step)] == true
+	end
+
 	local cliff = nil
 	if not isBlock then
 		cliff = function(a: any, b: any): boolean
@@ -962,12 +1000,12 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 
 		buildCorners()
 
-		-- NO EDGE MAY CROSS GROUND THAT IS NOT WALKABLE.
+		-- NO EDGE MAY PASS THROUGH SOLID.
 		--
-		-- A straight edge between two corners leaves the cells whenever the
-		-- boundary it stands for is concave there -- geometry, not a fault: a
-		-- chord cannot follow a concave chain from inside. Six of this map's 437
-		-- edges do it, by 0.67 to 1.10 studs.
+		-- The test is solidity, not mask membership. An edge that strays a little
+		-- past this grid's cells onto a neighbour's floor has crossed a seam and
+		-- costs nothing; an edge that runs into masonry has crossed a wall, and
+		-- that is the one worth giving up ground to avoid.
 		--
 		-- The choice is to add a vertex or to give up the ground, and giving up
 		-- ground is the safe direction and the one that does not spend segments.
@@ -986,15 +1024,15 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				local L = len(sub(B, A))
 				if L > 0.05 then
 					local steps = math.clamp(math.floor(L * 3), 4, 40)
-					local outside = false
+					local hitsSolid = false
 					for k = 0, steps do
 						local t = k / steps
-						if not inMask(A.x + (B.x - A.x) * t, A.z + (B.z - A.z) * t) then
-							outside = true
+						if isSolid(A.x + (B.x - A.x) * t, A.z + (B.z - A.z) * t) then
+							hitsSolid = true
 							break
 						end
 					end
-					if outside then
+					if hitsSolid then
 						-- the edge leaving this corner runs along line i+1
 						local li = i % nL + 1
 						if extra[li] + c.crossStep <= c.crossMax then
