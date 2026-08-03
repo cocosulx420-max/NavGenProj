@@ -59,6 +59,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- Corner detection. `cornerWindow` nodes either side are averaged before the
+	-- normals are compared, and a swing of `cornerAngle` or more is a corner.
+	cornerWindow: number?,
+	cornerAngle: number?,
+
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
 	-- two meet properly.
@@ -78,7 +83,10 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
-	cornerSpan = 4.0,
+	cornerWindow = 3,
+	cornerAngle = 40,
+	-- corners are explicit now, so nothing needs deleting to tidy up after them
+	cornerSpan = 0,
 	cornerDeg = 45,
 	maxGap = 3.0,
 	mergeNeedsFit = false,
@@ -252,6 +260,101 @@ local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any
 end
 
 --------------------------------------------------------------------------
+-- CORNERS, FOUND BEFORE ANY LINE IS FITTED
+--
+-- Every earlier version discovered corners by accident: grow a line until the
+-- residual fails, and call wherever it failed a corner. That is backwards, and
+-- it produced every corner problem in this file's history -- corners landing a
+-- node early because the fit is greedy, chamfers in the crook that then had to
+-- be deleted by a length threshold, and that threshold deleting real corners
+-- along with the chamfers.
+--
+-- A corner is a property of the ground, not of the fit. Each boundary node
+-- already knows which of its eight neighbours are blocked, so it knows which way
+-- is out: the outward normal is the sum of the directions that are blocked. Walk
+-- the ring and that normal is constant along a straight rim at ANY angle -- a
+-- 45-degree wall gives every node the same {E, NE, N} and the same normal -- and
+-- swings where the rim turns. The corner is where it swings.
+--
+-- Two details make it robust rather than noisy:
+--
+--   * Compare a window BEFORE the node against a window AFTER it, never node to
+--     node. A rim at 22 degrees alternates between {E, NE} and {E, NE, N}, so
+--     adjacent normals wobble by 22 degrees on perfectly straight ground.
+--   * Suppress non-maxima. A real corner makes several consecutive nodes report
+--     a large swing, and only the sharpest of them is the corner.
+--
+-- Nothing here consults a Part: the masks come from LocalGrid's cells.
+--------------------------------------------------------------------------
+
+local DIR8N: {P2} = {}
+do
+	local r2 = math.sqrt(0.5)
+	local raw = {
+		{ 1, 0 }, { r2, r2 }, { 0, 1 }, { -r2, r2 },
+		{ -1, 0 }, { -r2, -r2 }, { 0, -1 }, { r2, -r2 },
+	}
+	for i, d in ipairs(raw) do DIR8N[i] = { x = d[1], z = d[2] } end
+end
+
+-- Which way is out, from the blocked neighbours this node can see. Falls back to
+-- the direction of the missing neighbour for a seam node, whose mask is empty
+-- because the floor really does continue there.
+local function outwardAt(cell: any, fallback: {number}): P2
+	local mask = bit32.bor(cell.wallMask or 0, cell.dropMask or 0)
+	local ax, az = 0, 0
+	for bit = 1, 8 do
+		if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
+			ax += DIR8N[bit].x
+			az += DIR8N[bit].z
+		end
+	end
+	local m = math.sqrt(ax * ax + az * az)
+	if m < 1e-6 then
+		ax, az = fallback[1], fallback[2]
+		m = math.sqrt(ax * ax + az * az)
+		if m < 1e-6 then return { x = 1, z = 0 } end
+	end
+	return { x = ax / m, z = az / m }
+end
+
+local function findCorners(nrm: {P2}, c: any): {boolean}
+	local n = #nrm
+	local isCorner = table.create(n, false)
+	if n < 5 then return isCorner end
+	local w = math.max(1, math.floor(c.cornerWindow))
+	local turn = table.create(n, 0)
+	for i = 1, n do
+		local bx, bz, ax, az = 0, 0, 0, 0
+		for k = 1, w do
+			local b = nrm[(i - 1 - k) % n + 1]
+			local a = nrm[(i - 1 + k) % n + 1]
+			bx += b.x; bz += b.z
+			ax += a.x; az += a.z
+		end
+		local bm = math.sqrt(bx * bx + bz * bz)
+		local am = math.sqrt(ax * ax + az * az)
+		if bm > 1e-6 and am > 1e-6 then
+			local d = (bx * ax + bz * az) / (bm * am)
+			turn[i] = math.deg(math.acos(math.clamp(d, -1, 1)))
+		end
+	end
+	local lim = c.cornerAngle
+	for i = 1, n do
+		if turn[i] >= lim then
+			-- only the sharpest node of a run of candidates is the corner
+			local best = true
+			for k = -w, w do
+				local j = (i - 1 + k) % n + 1
+				if turn[j] > turn[i] or (turn[j] == turn[i] and j < i) then best = false; break end
+			end
+			isCorner[i] = best
+		end
+	end
+	return isCorner
+end
+
+--------------------------------------------------------------------------
 -- STEP 4 — greedy line fit. THIS IS WHERE THE STAIRCASE DIES.
 --
 -- Walk the loop maintaining a best-fit line through the cells accepted so far.
@@ -267,7 +370,7 @@ end
 -- against real geometry instead.
 --------------------------------------------------------------------------
 
-local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any)
+local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any, corner: {boolean}?)
 	local n = #pts
 	local segs: {any} = {}
 	if n < 2 then return segs end
@@ -340,6 +443,16 @@ local function segmentLoop(pts: {P2}, c: any, cls: {string}, stats: any)
 			continue
 		end
 		gapAt = nil
+
+		-- A CORNER ENDS A RUN, whatever the residual thinks. The corner was found
+		-- from the ground before any line existed, so the fit does not get a vote
+		-- on where it is -- it only decides how the straight bits between corners
+		-- are drawn.
+		if corner and corner[i] and #cur >= 2 then
+			fitAndPush(cur, T)
+			cur = { i }
+			continue
+		end
 
 		-- A reversal still ends a run, and the residual cannot see it: round the
 		-- end of a strip narrower than fitTol and every returning node is within
@@ -720,6 +833,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local pts: {P2} = {}
 		local cls: {string} = {}
 		local owner: {any} = {}
+		local nrm: {P2} = {}
 		local lastCell, lastCls = nil, nil
 		for _, s in ipairs(loop) do
 			local k = classOf(g, s)
@@ -730,6 +844,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
 				cls[#cls + 1] = k
 				owner[#owner + 1] = s.cell
+				nrm[#nrm + 1] = outwardAt(s.cell, s.dir)
 				lastCell, lastCls = s.cell, k
 			end
 			stats.edges += 1
@@ -748,24 +863,19 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- silently dropping them is the one operation in this module that can
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
-		local rawSegs = segmentLoop(pts, c, cls, stats)
+		-- corners first, from the ground; the fit is told where they are
+		local corner = findCorners(nrm, c)
+		for i = 1, #corner do
+			if corner[i] and owner[i] then
+				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
+				owner[i].edgeCorner = true
+			end
+		end
+		local rawSegs = segmentLoop(pts, c, cls, stats, corner)
 		local segs = mergeSegments(pts, rawSegs, c, stats)
 		stats.rawSegments += #segs
 
-		-- WHERE AN EDGE BEGINS IS A CORNER, and nothing else is.
-		--
-		-- Not a geometric property of a node: a long straight wall at 45 degrees
-		-- has every node turning against the lattice and not one of them is a
-		-- corner of the drawn boundary. What matters is where the fit decided one
-		-- line had to stop and the next start, which is exactly a run's first
-		-- node. Marked back onto the cell so the node viz can shade it.
-		for _, sg in ipairs(segs) do
-			local cell = owner[sg.idx[1]]
-			if cell then
-				if not cell.edgeCorner then stats.edgeCorners += 1 end
-				cell.edgeCorner = true
-			end
-		end
+
 		if c.debugPart and g.part == c.debugPart then
 			local function snap(list)
 				local out = {}
