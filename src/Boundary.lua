@@ -59,6 +59,11 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- Two adjacent lines carrying different offsets and meeting at less than
+	-- this are stepped between rather than crossed: their intersection is not a
+	-- corner, it is an artefact of the standoff changing.
+	stepDeg: number?,
+
 	-- STEP 6. The inward offset, applied to WALL runs only. `agentRadius` is how
 	-- far a body must stay off masonry; `margin` is how much ground must remain
 	-- behind the line before any of it is given up.
@@ -89,6 +94,7 @@ local DEFAULT = {
 	maxGap = 3.0,
 	mergeNeedsFit = false,
 	insetAll = true,
+	stepDeg = 30,
 	agentRadius = 1.5,
 	margin = 0.5,
 }
@@ -990,6 +996,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- 125. The anchor is a boundary CELL CENTRE, so it is on a live cell by
 		-- construction -- fall all the way back to it and the polygon cannot
 		-- leave the mask at a corner at all.
+		local cosStep = math.cos(math.rad(c.stepDeg))
 		local how = "cross"
 		local function put(p: P2, k: string)
 			if not inMask(p.x, p.z) then
@@ -1036,7 +1043,24 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				-- refused and bevelled across instead. Cell lookup only.
 				local outside = not inMask(px, pz)
 				if outside then stats.cornersOffMask += 1 end
-				if outside or len(sub({ x = px, z = pz }, anchor)) > c.miterLimit then
+				-- WHERE THE OFFSET CHANGES, THE BOUNDARY STEPS.
+				--
+				-- A wall line is pushed in by up to agentRadius; a ledge or a seam
+				-- is not pushed at all. Crossing them is fine when they meet
+				-- head-on, and meaningless when they run near-parallel -- a wall
+				-- alongside a ledge produced a 27.8-stud wedge closing at 1 degree,
+				-- the boundary drifting from one line to the other across the whole
+				-- length of it.
+				--
+				-- There is no corner there to find. The two lines describe the same
+				-- ground at two different standoffs, so the honest figure is a step:
+				-- drop the shared node onto each line and join the two feet. Short,
+				-- perpendicular, and it says what actually happens -- the boundary
+				-- moves in because masonry starts here.
+				local stepChange = math.abs((l1.push or 0) - (l2.push or 0)) > 1e-6
+					and dot(l1.dir, l2.dir) > cosStep
+				if stepChange then stats.offsetSteps += 1 end
+				if stepChange or outside or len(sub({ x = px, z = pz }, anchor)) > c.miterLimit then
 					-- MITER LIMIT. An acute corner throws the intersection
 					-- arbitrarily far out; bevel across it instead.
 					-- A BEVEL OF NO WIDTH IS A TWITCH, NOT A CORNER.
@@ -1138,7 +1162,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
 		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
-		wallRuns = 0, offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
+		wallRuns = 0, offsetSteps = 0, offsetSum = 0, offsetMin = math.huge, offsetMax = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
