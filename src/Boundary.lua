@@ -845,6 +845,36 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			-- class holds: a cell with a wall on one side and a seam on the other
 			-- has to appear twice or one of the two runs loses its start point.
 			if s.cell ~= lastCell or k ~= lastCls then
+				-- THE APEX OF A DIAGONAL TURN IS NOT ON THE RING, and it is the
+				-- node a corner belongs to.
+				--
+				-- Where solid touches the floor only at its corner, the two cells
+				-- either side of it each have a blocked cardinal and land on the
+				-- ring, but the cell at the inside of the turn has all four
+				-- cardinals clear -- only a diagonal is blocked -- so the trace
+				-- walks straight past it. Cocosulx marked those nodes by hand as
+				-- the corners, and no threshold could ever reach them because they
+				-- were never in the ring to begin with.
+				--
+				-- Consecutive ring cells sitting diagonally from each other are
+				-- exactly that case, so the walkable cell they share is inserted
+				-- between them. It is a node of this grid like any other; the ring
+				-- simply now goes through the turn instead of around it.
+				if lastCell then
+					local du = s.cell.ui - lastCell.ui
+					local dv = s.cell.vi - lastCell.vi
+					if math.abs(du) == 1 and math.abs(dv) == 1 then
+						local tip = g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)]
+							or g.index[(lastCell.ui + du) .. ":" .. lastCell.vi]
+						if tip and tip ~= s.cell and tip ~= lastCell then
+							pts[#pts + 1] = { x = (tip.ui + 0.5) * step, z = (tip.vi + 0.5) * step }
+							cls[#cls + 1] = k
+							owner[#owner + 1] = tip
+							nrm[#nrm + 1] = outwardAt(tip, s.dir)
+							stats.apexNodes += 1
+						end
+					end
+				end
 				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
 				cls[#cls + 1] = k
 				owner[#owner + 1] = s.cell
@@ -1142,7 +1172,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, edgeCorners = 0,
+		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, edgeCorners = 0, apexNodes = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
