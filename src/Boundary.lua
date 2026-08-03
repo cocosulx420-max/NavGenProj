@@ -321,7 +321,7 @@ end
 -- a node early and left a chamfer in the crook. On a skim the two look alike.
 --------------------------------------------------------------------------
 
-local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
+local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: any?): {boolean}
 	local n = #lat
 	local isCorner = table.create(n, false)
 	if n < 8 then return isCorner end
@@ -465,8 +465,31 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 			local run = { i }			-- node indices accepted into this run
 			local tentAt: number? = nil		-- position in `run` where drift began
 			local tentTravel: number? = nil	-- lastTravel as it stood at that moment
+			local classEnd: number? = nil
+			local runCls = cls and cls[i] or nil
 			local j, moved = i, 0
 			while moved < n do
+				local nxt = j % n + 1
+
+				-- RULE 0. A RUN ENDS WHERE ITS CLASS ENDS, AND THE BOUNDARY IS THE
+				-- CORNER ITSELF -- not a travel move walked back to.
+				--
+				-- A wall and a dropoff that meet are two different boundaries, and
+				-- the tracer already says so: it emits the shared cell TWICE, once
+				-- per class, precisely so each run gets its own endpoint. This walk
+				-- used to read `lat` alone and sail straight through the change, so
+				-- a long straight dropoff column would carry on into the wall
+				-- staircase beyond it -- indistinguishable by sign, since the
+				-- staircase's cross-moves look exactly like that column's steps --
+				-- and get cut three nodes late by drift. The blue edge was then
+				-- dragged off thirteen collinear nodes to reach a corner sitting in
+				-- the middle of a red staircase.
+				--
+				-- Exact, and it needs no tolerance, so it is checked before the sign
+				-- rules and long before drift. The information was in the data the
+				-- whole time; nothing was reading it.
+				if runCls and cls[nxt] ~= runCls then classEnd = j; why = "class"; break end
+
 				local dMaj, dMin = major[j], minor[j]
 
 				-- rule 1 and rule 2, exact
@@ -479,7 +502,6 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 					if sSign == 0 then sSign = s elseif s ~= sSign then why = "step"; break end
 				end
 
-				local nxt = j % n + 1
 				if dMaj ~= 0 then lastTravel = j end
 				run[#run + 1] = nxt
 
@@ -501,6 +523,12 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 			-- that belongs to whatever comes next and must not be consumed here,
 			-- or the following run starts mid-stride and never establishes an axis.
 			local stop = (why == "drift" and tentTravel) or lastTravel or j
+			-- A class break owns its boundary node outright, so it both consumes
+			-- and marks that node and hands the next run the far side of the seam.
+			-- Anything else stops at its last travel move and leaves the rest to
+			-- whoever comes next.
+			local consumeTo = classEnd or stop
+			local markAt = classEnd or (stop % n + 1)
 			local before = consumed
 			local k = i
 			while true do
@@ -508,12 +536,12 @@ local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 					visited[k] = true
 					consumed += 1
 				end
-				if k == stop then break end
+				if k == consumeTo then break end
 				k = k % n + 1
 			end
-			mark[stop % n + 1] = true
+			mark[markAt] = true
 			if tally then tally[why] = (tally[why] or 0) + 1 end
-			i = stop % n + 1
+			i = consumeTo % n + 1
 			-- a run that consumed nothing would spin forever; step past it
 			if consumed == before then
 				if not visited[i] then visited[i] = true; consumed += 1 end
@@ -1052,7 +1080,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		if #pts < 3 then continue end
 
 		-- PASS ONE: corners, read off the staircase, before any line is fitted.
-		local corner = staircaseCorners(lat, c, stats.ruleTally)
+		local corner = staircaseCorners(lat, cls, c, stats.ruleTally)
 		if c.captureRings then
 			stats.ringDump = stats.ringDump or {}
 			stats.ringDump[#stats.ringDump + 1] =
