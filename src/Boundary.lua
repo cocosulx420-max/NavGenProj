@@ -561,7 +561,25 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 			-- it. Converting here keeps the two conventions from mixing.
 			local stop
 			if why == "drift" and cutBefore then
-				stop = ((cutBefore - 2) % n) + 1
+				-- WHERE IT LEFT THE LINE, NOT WHERE WE STOPPED BELIEVING IT.
+				--
+				-- `cutBefore` is the last node a given tolerance happened to
+				-- CONFIRM, so it slides one node later every time driftTol is
+				-- loosened -- measured on case8, which a stricter setting marked
+				-- exactly and a looser one marked one node late. A corner is a fact
+				-- about the ground and must not move because we changed how
+				-- suspicious we are.
+				--
+				-- So walk back while the offsets are descending and stop at the
+				-- bottom of the dip. That node lies on the line whatever tolerance
+				-- was in force, which makes the cut tolerance-independent.
+				local m = #conf
+				while m > 2 do
+					local dCur = offLine(conf[m], fu, fv, fdx, fdz)
+					local dPrev = offLine(conf[m - 1], fu, fv, fdx, fdz)
+					if dCur > dPrev then m -= 1 else break end
+				end
+				stop = ((conf[m] - 2) % n) + 1
 			else
 				stop = lastTravel or j
 			end
