@@ -59,6 +59,13 @@ export type Config = {
 	-- replaces, bevel across instead.
 	miterLimit: number?,
 
+	-- Keeping edges off un-walkable ground. `crossStep` is how far a line is
+	-- pushed in per attempt, `crossMax` how far it may be pushed in total, and
+	-- `crossPasses` how many times the corners are rebuilt before giving up.
+	crossStep: number?,
+	crossMax: number?,
+	crossPasses: number?,
+
 	-- A run shorter than `cornerSpan` sitting between two runs that turn through
 	-- more than `cornerDeg` is a chamfer across a corner, and is dropped so the
 	-- two meet properly.
@@ -78,6 +85,9 @@ local DEFAULT = {
 	minSegLen = 1.0,
 	collinearDeg = 20,
 	miterLimit = 6.0,
+	crossStep = 0.25,
+	crossMax = 1.5,
+	crossPasses = 6,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -851,6 +861,11 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		local vcls: {string} = {}
 		local vhow: {string} = {}
 
+		-- extra inward push applied to a line because an edge along it strayed
+		-- off the walkable cells; see the retry below
+		local extra: {number} = table.create(#lines, 0)
+		for i = 1, #lines do extra[i] = 0 end
+
 		local anchorNow: P2 = { x = 0, z = 0 }
 		local function footOn(L: any, p: P2): P2
 			local d = L.c - dot(p, L.n)
@@ -883,8 +898,14 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			vhow[#vhow + 1] = how
 		end
 		local nL = #lines
+		local function buildCorners()
+			verts = {}
+			vcls = {}
+			vhow = {}
 		for i = 1, nL do
 			local l1, l2 = lines[i], lines[(i % nL) + 1]
+			l1 = { n = l1.n, c = l1.c - extra[i], anchor = l1.anchor, class = l1.class }
+			l2 = { n = l2.n, c = l2.c - extra[(i % nL) + 1], anchor = l2.anchor, class = l2.class }
 			-- the edge LEAVING this corner runs along l2, so it carries l2's class
 			local leaving = l2.class
 			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
@@ -937,6 +958,57 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				end
 			end
 		end
+		end
+
+		buildCorners()
+
+		-- NO EDGE MAY CROSS GROUND THAT IS NOT WALKABLE.
+		--
+		-- A straight edge between two corners leaves the cells whenever the
+		-- boundary it stands for is concave there -- geometry, not a fault: a
+		-- chord cannot follow a concave chain from inside. Six of this map's 437
+		-- edges do it, by 0.67 to 1.10 studs.
+		--
+		-- The choice is to add a vertex or to give up the ground, and giving up
+		-- ground is the safe direction and the one that does not spend segments.
+		-- So an offending edge's own line is pushed inward a quarter-cell at a
+		-- time and the corners rebuilt, since moving one line moves the corners
+		-- either side of it and can shift the problem next door.
+		--
+		-- Bounded on both ends: a fixed number of passes, and a cap on how far any
+		-- one line may be pushed. Past the cap the edge is left crossing and
+		-- counted, because eroding further to hide it costs more than it is worth.
+		for _ = 1, c.crossPasses do
+			local moved = false
+			local n = #verts
+			for i = 1, n do
+				local A, B = verts[i], verts[i % n + 1]
+				local L = len(sub(B, A))
+				if L > 0.05 then
+					local steps = math.clamp(math.floor(L * 3), 4, 40)
+					local outside = false
+					for k = 0, steps do
+						local t = k / steps
+						if not inMask(A.x + (B.x - A.x) * t, A.z + (B.z - A.z) * t) then
+							outside = true
+							break
+						end
+					end
+					if outside then
+						-- the edge leaving this corner runs along line i+1
+						local li = i % nL + 1
+						if extra[li] + c.crossStep <= c.crossMax then
+							extra[li] += c.crossStep
+							moved = true
+						end
+					end
+				end
+			end
+			if not moved then break end
+			buildCorners()
+			stats.crossRetries += 1
+		end
+
 		if #verts < 3 then
 			local box = boxIfExact(pts, step)
 			if box then
@@ -1011,7 +1083,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		edges = 0, seam = 0, wall = 0, drop = 0,
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
-		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
+		wallsInset = 0, singletonRuns = 0, chamfersCut = 0, crossRetries = 0,
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
