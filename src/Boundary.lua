@@ -944,6 +944,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			--
 			-- So a wall line is moved in until no node of its own run lies outside
 			-- it. Erosion, and the safe direction.
+			local inset = 0
 			if isWall(sg.class) or c.insetAll then
 				local inner = math.huge
 				for _, i in ipairs(sg.idx) do
@@ -952,6 +953,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				end
 				if inner < cval then
 					stats.wallsInset += 1
+					inset = cval - inner
 					cval = inner
 				end
 			end
@@ -993,14 +995,22 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			-- lie. The tightest point along the run governs the whole run.
 			local push = 0
 			if isWall(sg.class) and c.agentRadius > 0 then
-				local reach = c.agentRadius + c.keepWidth * 0.5 + 2 * step
+				local reach = 2 * c.agentRadius + c.keepWidth + 4 * step
 				local tight = math.huge
+				local farPushes = false
 				for _, i in ipairs(sg.idx) do
 					local best = 0
 					local t = step * 0.5
 					while t <= reach do
-						local d = distAt(pts[i].x - nrm.x * t, pts[i].z - nrm.z * t)
+						local a, b = pts[i].x - nrm.x * t, pts[i].z - nrm.z * t
+						if not inMask(a, b) then break end
+						local d = distAt(a, b)
 						if d > best then best = d end
+						-- ONLY A WALL OPPOSITE WILL ALSO MOVE. Remember whether the
+						-- far side of this ground is masonry: it decides how much of
+						-- the width this line is allowed to spend.
+						local cell = g.index[math.floor(a / step) .. ":" .. math.floor(b / step)]
+						if cell and cell.wall then farPushes = true end
 						t += step * 0.5
 					end
 					if best < tight then tight = best end
@@ -1022,7 +1032,25 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					-- Still graded, not switched: the push rises continuously from
 					-- zero at keepWidth, so two adjacent runs either side of the
 					-- threshold do not offset by r and by 0 and stop sharing an edge.
-					push = math.clamp(tight - c.keepWidth * 0.5, 0, c.agentRadius)
+					-- HOW MUCH OF THE WIDTH THIS LINE MAY SPEND depends on whether
+					-- anything opposite is going to spend some too. Facing another
+					-- wall, both sides move and each gets half the surplus. Facing a
+					-- ledge or a seam or open air, nothing else moves and this line
+					-- may take all of it.
+					--
+					-- Assuming both sides always move throttled every wall opposite a
+					-- ledge to half what it could afford: 26 such edges averaged 4.2
+					-- studs of ground and a push of 0.57, and one had 8 studs across
+					-- to a dropoff and moved by nothing at all.
+					local budget = farPushes
+						and (tight - c.keepWidth * 0.5)
+						or (2 * tight - c.keepWidth)
+					-- The line has already been moved off its nodes by the inset, and
+					-- that standoff counts. Adding the full agent radius on top makes
+					-- the total inset + r rather than r, which is why clearance came
+					-- out at 1.63 against a 1.50 target.
+					push = math.clamp(budget, 0, c.agentRadius) - inset
+					if push < 0 then push = 0 end
 					stats.offsetSum += push
 					if push < stats.offsetMin then stats.offsetMin = push end
 					if push > stats.offsetMax then stats.offsetMax = push end
