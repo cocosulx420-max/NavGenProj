@@ -353,39 +353,19 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 			-- beyond that corner only one move in six is travel on the old axis,
 			-- because the run now travels along the other one. Same window, no
 			-- warm-up, and it works on a run six moves long.
-			local isU = (su >= sv)
 			local lastTravel: number? = nil
 			local j, moved = i, 0
 			while moved < n do
-				if major[j] ~= 0 then lastTravel = j end
-
-				-- DOES THIS RUN'S AXIS STILL LEAD?
-				--
-				-- Testing only on a step misses two whole families of corner.
-				--
-				-- A rim can be perfectly straight and axis-aligned, with no steps
-				-- anywhere: case2 on Part06 is 74 nodes at a single u, so the step
-				-- test was never once evaluated and the walk sailed through both
-				-- ends. And a rim can turn by a DIAGONAL move, which advances on
-				-- both axes at once and therefore counts as travel whichever axis
-				-- is major -- so it can never be a step either. Both of case2's
-				-- corners turn that way, and both were unreachable by construction.
-				--
-				-- Asking which axis leads the next few moves covers all of it. On a
-				-- staircase the travel axis still leads five or six to one. Past a
-				-- turn the other axis leads, whether the turn was a step, a
-				-- diagonal, or a clean right angle out of a rim with no steps at
-				-- all. Ties keep the current axis, so a 45-degree rim -- where both
-				-- axes advance equally -- is one run and not a corner every node.
-				local au, av = 0, 0
-				for k = 1, W do
-					local q = (j - 1 + k) % n + 1
-					au += math.abs(mu[q])
-					av += math.abs(mv[q])
+				if major[j] ~= 0 then
+					lastTravel = j
+				else
+					-- a step: is travel still what mostly follows?
+					local ahead = 0
+					for k = 1, W do
+						if major[(j - 1 + k) % n + 1] ~= 0 then ahead += 1 end
+					end
+					if ahead / W < c.travelFloor then break end
 				end
-				local stillLeads = isU and (au >= av) or (not isU and av >= au)
-				if not stillLeads then break end
-
 				j = j % n + 1
 				moved += 1
 			end			-- The run owns the moves up to its last travelling one; anything past
