@@ -96,6 +96,7 @@ local DEFAULT = {
 	driftTol = 1.0,
 	driftSpan = 4,
 	driftGrow = 0.25,
+	classBreaks = true,
 	cornerSpan = 4.0,
 	cornerDeg = 45,
 	maxGap = 3.0,
@@ -496,7 +497,9 @@ local function staircaseCorners(lat: {{number}}, cls: {string}?, c: any, tally: 
 				-- Exact, and it needs no tolerance, so it is checked before the sign
 				-- rules and long before drift. The information was in the data the
 				-- whole time; nothing was reading it.
-				if runCls and cls[nxt] ~= runCls then classEnd = j; why = "class"; break end
+				if runCls and c.classBreaks ~= false and cls[nxt] ~= runCls then
+					classEnd = j; why = "class"; break
+				end
 
 				local dMaj, dMin = major[j], minor[j]
 
