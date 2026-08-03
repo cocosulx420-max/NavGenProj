@@ -347,7 +347,17 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				sum += isStep
 				h = h % W + 1
 				if filled < W then filled += 1 end
-				if filled == W and (sum / W) > baseRate + jump then break end
+				-- THE CHARACTER CHANGED, IN EITHER DIRECTION.
+				--
+				-- A one-sided test can only see stepping become more frequent, and
+				-- half of all turns are the other way round: a staircase running
+				-- into a straight rim steps LESS, not more. It was also
+				-- unreachable. Written as `local > base + jump`, a run that begins
+				-- on a staircase has base around 0.5 and therefore a threshold
+				-- above 1.0, which a rate cannot exceed -- so the run never ended,
+				-- swallowed the whole ring and emitted a single corner. Ring 4 of
+				-- Part06: 112 nodes, 1 corner.
+				if filled == W and math.abs(sum / W - baseRate) > jump then break end
 				j = j % n + 1
 				moved += 1
 			end
