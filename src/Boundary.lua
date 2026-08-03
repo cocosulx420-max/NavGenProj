@@ -1001,18 +1001,24 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 				for _, i in ipairs(sg.idx) do
 					local best = 0
 					local t = step * 0.5
+					-- ONLY A WALL OPPOSITE WILL ALSO MOVE, and it is the FAR side
+					-- that decides. Testing every cell along the way answers the
+					-- wrong question: the march begins on this line's own wall node,
+					-- so "is any of this masonry" is always yes. March until the
+					-- ground runs out and ask the last cell before the edge.
+					local farCell = nil
 					while t <= reach do
 						local a, b = pts[i].x - nrm.x * t, pts[i].z - nrm.z * t
-						if not inMask(a, b) then break end
+						local cell = g.index[math.floor(a / step) .. ":" .. math.floor(b / step)]
+						if not cell then break end
 						local d = distAt(a, b)
 						if d > best then best = d end
-						-- ONLY A WALL OPPOSITE WILL ALSO MOVE. Remember whether the
-						-- far side of this ground is masonry: it decides how much of
-						-- the width this line is allowed to spend.
-						local cell = g.index[math.floor(a / step) .. ":" .. math.floor(b / step)]
-						if cell and cell.wall then farPushes = true end
+						farCell = cell
 						t += step * 0.5
 					end
+					-- reaching `reach` without running out means the far side is too
+					-- distant to matter, and nothing over there is going to move
+					if t <= reach and farCell and farCell.wall then farPushes = true end
 					if best < tight then tight = best end
 				end
 				if tight < math.huge then
