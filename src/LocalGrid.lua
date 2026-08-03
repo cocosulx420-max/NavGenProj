@@ -436,7 +436,7 @@ function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
 			-- "this kind of node, where an edge breaks" rather than as a fourth
 			-- class. Set by Boundary, so it only shows after a bake.
 			if cell.edgeCorner then
-				col = Color3.new(col.R * 0.45, col.G * 0.45, col.B * 0.45)
+				col = Color3.new(col.R * 0.22, col.G * 0.22, col.B * 0.22)
 			end
 			if col == PLAIN and not showInterior then continue end
 			local dot = Instance.new("Part")
