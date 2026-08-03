@@ -317,7 +317,7 @@ end
 -- a node early and left a chamfer in the crook. On a skim the two look alike.
 --------------------------------------------------------------------------
 
-local function staircaseCorners(lat: {{number}}, c: any): {boolean}
+local function staircaseCorners(lat: {{number}}, c: any, tally: any?): {boolean}
 	local n = #lat
 	local isCorner = table.create(n, false)
 	if n < 8 then return isCorner end
@@ -346,7 +346,7 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	-- boundary nodes and reported 39 corners, while short rings looked perfectly
 	-- healthy at 4 apiece -- an aggregate that looks plausible and is mostly
 	-- unvisited ground.
-	local function lap(start: number, mark: {boolean})
+	local function lap(start: number, mark: {boolean}, tally: any?)
 		local visited = table.create(n, false)
 		local i, consumed = start, 0
 		while consumed < n do
@@ -379,6 +379,7 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 			-- of reach of every step-pattern test: its rim turns via a diagonal and
 			-- so never registered a step to bracket.
 			local lastTravel: number? = nil
+			local why = "exhausted"
 			local tSign, sSign = 0, 0
 			local hu, hv = 0.0, 0.0		-- summed move vector: average heading
 			local cu, cv = lat[i][1] + 0.0, lat[i][2] + 0.0	-- centroid accumulator
@@ -390,11 +391,11 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				-- rule 1 and rule 2, exact
 				if dMaj ~= 0 then
 					local s = sgn(dMaj)
-					if tSign == 0 then tSign = s elseif s ~= tSign then break end
+					if tSign == 0 then tSign = s elseif s ~= tSign then why = "travel"; break end
 				end
 				if dMin ~= 0 then
 					local s = sgn(dMin)
-					if sSign == 0 then sSign = s elseif s ~= sSign then break end
+					if sSign == 0 then sSign = s elseif s ~= sSign then why = "step"; break end
 				end
 
 				local nxt = j % n + 1
@@ -409,7 +410,7 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 						local du = lat[nxt][1] - ax
 						local dv = lat[nxt][2] - az
 						local perp = math.abs(du * (hv / hl) - dv * (hu / hl))
-						if perp > tol then break end
+						if perp > tol then why = "drift"; break end
 					end
 				end
 
@@ -435,6 +436,7 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				k = k % n + 1
 			end
 			mark[stop % n + 1] = true
+			if tally then tally[why] = (tally[why] or 0) + 1 end
 			i = stop % n + 1
 			-- a run that consumed nothing would spin forever; step past it
 			if consumed == before then
@@ -452,7 +454,7 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 	for k = 1, n do
 		if seed[k] then start = k; break end
 	end
-	lap(start, isCorner)
+	lap(start, isCorner, tally)
 	return isCorner
 end
 
@@ -974,7 +976,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		if #pts < 3 then continue end
 
 		-- PASS ONE: corners, read off the staircase, before any line is fitted.
-		local corner = staircaseCorners(lat, c)
+		local corner = staircaseCorners(lat, c, stats.ruleTally)
 		for i = 1, #corner do
 			if corner[i] and owner[i] then
 				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
@@ -1259,7 +1261,7 @@ function Boundary.fromLocal(localData: any, cfg: Config?)
 		-- corners refused because the intersection landed off the walkable cells
 		cornersOffMask = 0, cornersClamped = 0, cornersLost = 0, bevelsCollapsed = 0, breaksSlid = 0,
 		wallsInset = 0, singletonRuns = 0, chamfersCut = 0,
-		edgeCorners = 0, apexNodes = 0,
+		edgeCorners = 0, apexNodes = 0, ruleTally = {},
 		-- worst mean signed distance from a line to its own nodes; 0 = balanced
 		worstLean = 0, worstFit = 0, linesOffNodes = 0,
 	}
