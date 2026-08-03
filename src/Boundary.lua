@@ -328,36 +328,48 @@ local function staircaseCorners(lat: {{number}}, c: any): {boolean}
 				sv += math.abs(mv[j])
 			end
 			local major = (su >= sv) and mu or mv
-			local baseSteps = 0
-			for k = 0, W - 1 do
-				if major[(i - 1 + k) % n + 1] == 0 then baseSteps += 1 end
-			end
-			local baseRate = baseSteps / W
 
-			-- Follow it while it keeps that character.
+			-- Follow it while it keeps its character.
+			--
+			-- THE BASELINE TRACKS THE RUN. It used to be measured once over the
+			-- run's first few moves and then frozen, which fails whenever a run
+			-- begins somewhere awkward: the baseline is contaminated from the
+			-- outset and every corner afterwards is judged against a rate the run
+			-- never actually had. The labelled corner on Part06 sits behind six
+			-- pure-travel moves and a turn into a staircase -- rate 0 against 0.83,
+			-- which no threshold could miss -- and it was missed anyway, because
+			-- the run reached it carrying a baseline from far earlier.
+			--
+			-- So the run's character is everything it has done EXCEPT its last few
+			-- moves, and the comparison is against those last few. History grows
+			-- as the run proceeds, so a long straight rim is judged against itself
+			-- rather than against wherever the walk happened to begin.
 			local hist = table.create(W, 0)
-			local h, filled, sum = 1, 0, 0
+			local h, filled, recent = 1, 0, 0
+			local histSteps, histMoves = 0, 0
+			local minHist = math.max(2, math.ceil(W / 2))
 			local lastTravel: number? = nil
 			local j, moved = i, 0
 			while moved < n do
 				local isStep = (major[j] == 0) and 1 or 0
 				if isStep == 0 then lastTravel = j end
-				sum -= hist[h]
+				-- the move falling out of the recent window becomes history
+				if filled == W then
+					histSteps += hist[h]
+					histMoves += 1
+				else
+					filled += 1
+				end
+				recent -= hist[h]
 				hist[h] = isStep
-				sum += isStep
+				recent += isStep
 				h = h % W + 1
-				if filled < W then filled += 1 end
-				-- THE CHARACTER CHANGED, IN EITHER DIRECTION.
-				--
-				-- A one-sided test can only see stepping become more frequent, and
-				-- half of all turns are the other way round: a staircase running
-				-- into a straight rim steps LESS, not more. It was also
-				-- unreachable. Written as `local > base + jump`, a run that begins
-				-- on a staircase has base around 0.5 and therefore a threshold
-				-- above 1.0, which a rate cannot exceed -- so the run never ended,
-				-- swallowed the whole ring and emitted a single corner. Ring 4 of
-				-- Part06: 112 nodes, 1 corner.
-				if filled == W and math.abs(sum / W - baseRate) > jump then break end
+				-- Either direction ends the run: a staircase running into a
+				-- straight rim steps LESS, not more, and that is half of all turns.
+				if histMoves >= minHist
+					and math.abs(recent / W - histSteps / histMoves) > jump then
+					break
+				end
 				j = j % n + 1
 				moved += 1
 			end
