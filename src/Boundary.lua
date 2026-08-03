@@ -868,8 +868,23 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 					local du = s.cell.ui - lastCell.ui
 					local dv = s.cell.vi - lastCell.vi
 					if math.abs(du) == 1 and math.abs(dv) == 1 then
-						local tip = g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)]
-							or g.index[(lastCell.ui + du) .. ":" .. lastCell.vi]
+						-- BOTH shared cells have to be examined. A diagonal step has
+						-- two cells in common and usually both are walkable; taking
+						-- whichever was found first picked the wrong one and the
+						-- purity test then rejected it, so the apex it was meant to
+						-- catch was never inserted at all.
+						local tip = nil
+						for _, cand in ipairs({
+							g.index[lastCell.ui .. ":" .. (lastCell.vi + dv)],
+							g.index[(lastCell.ui + du) .. ":" .. lastCell.vi],
+						}) do
+							local blocked = bit32.bor(cand.wallMask or 0, cand.dropMask or 0)
+							if bit32.band(blocked, CARDINALS) == 0
+								and bit32.band(blocked, DIAGONALS) ~= 0 then
+								tip = cand
+								break
+							end
+						end
 						-- ONLY A PURE DIAGONAL IS AN APEX. Consecutive ring cells sit
 						-- diagonally all the way along a rotated rim, so the diagonal
 						-- step on its own says nothing -- inserting on it fired 396
@@ -882,13 +897,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 						-- bit and nothing else. A staircase step never looks like
 						-- that: the cell there has a blocked cardinal, which is what
 						-- put it on the rim in the first place.
-						local pure = false
-						if tip then
-							local blocked = bit32.bor(tip.wallMask or 0, tip.dropMask or 0)
-							pure = bit32.band(blocked, CARDINALS) == 0
-								and bit32.band(blocked, DIAGONALS) ~= 0
-						end
-						if pure and tip ~= s.cell and tip ~= lastCell then
+						if tip and tip ~= s.cell and tip ~= lastCell then
 							pts[#pts + 1] = { x = (tip.ui + 0.5) * step, z = (tip.vi + 0.5) * step }
 							cls[#cls + 1] = k
 							owner[#owner + 1] = tip
