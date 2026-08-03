@@ -1053,6 +1053,11 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 
 		-- PASS ONE: corners, read off the staircase, before any line is fitted.
 		local corner = staircaseCorners(lat, c, stats.ruleTally)
+		if c.captureRings then
+			stats.ringDump = stats.ringDump or {}
+			stats.ringDump[#stats.ringDump + 1] =
+				{ part = g.part and g.part.Name or "?", lat = lat, cls = cls, corner = corner }
+		end
 		for i = 1, #corner do
 			if corner[i] and owner[i] then
 				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
