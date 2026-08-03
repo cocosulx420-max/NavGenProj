@@ -326,7 +326,16 @@ local function outwardAt(cell: any, fallback: {number}): P2
 	return { x = ax / m, z = az / m }
 end
 
-local function findCorners(nrm: {P2}, c: any): {boolean}
+-- Is this node the apex of a turn -- every cardinal clear, a diagonal blocked?
+-- Solid touches it only at the corner, which is as close to "this node IS the
+-- corner" as the grid can state.
+local function isApexCell(cell: any): boolean
+	if not cell then return false end
+	local blocked = bit32.bor(cell.wallMask or 0, cell.dropMask or 0)
+	return bit32.band(blocked, CARDINALS) == 0 and bit32.band(blocked, DIAGONALS) ~= 0
+end
+
+local function findCorners(nrm: {P2}, owner: {any}, c: any): {boolean}
 	local n = #nrm
 	local isCorner = table.create(n, false)
 	if n < 5 then return isCorner end
@@ -347,14 +356,37 @@ local function findCorners(nrm: {P2}, c: any): {boolean}
 			turn[i] = math.deg(math.acos(math.clamp(d, -1, 1)))
 		end
 	end
+	-- WHICH NODE OF A TURN IS THE CORNER.
+	--
+	-- A real corner makes several consecutive nodes report a large swing, so one
+	-- of them has to be chosen. Choosing the largest swing is wrong on a
+	-- staircased rim: every normal there wobbles by 45 degrees, so the pick goes
+	-- to whichever neighbour wobbles hardest rather than to the node the corner
+	-- is actually at. Measured, that put 18 of Cocosulx's 51 corners exactly one
+	-- node off -- detected, but on the wrong cell.
+	--
+	-- Structure beats magnitude. A node with every cardinal clear and a diagonal
+	-- blocked is touching solid only at its corner, which is the grid saying
+	-- "the corner is here" as plainly as it can. So an apex outranks a bigger
+	-- swing, and swing only decides between nodes of the same kind.
+	local apex = table.create(n, false)
+	for i = 1, n do apex[i] = isApexCell(owner[i]) end
 	local lim = c.cornerAngle
+	local function outranks(j: number, i: number): boolean
+		if apex[j] ~= apex[i] then return apex[j] end
+		if turn[j] ~= turn[i] then return turn[j] > turn[i] end
+		return j < i
+	end
 	for i = 1, n do
 		if turn[i] >= lim then
-			-- only the sharpest node of a run of candidates is the corner
 			local best = true
 			for k = -w, w do
-				local j = (i - 1 + k) % n + 1
-				if turn[j] > turn[i] or (turn[j] == turn[i] and j < i) then best = false; break end
+				if k ~= 0 then
+					local j = (i - 1 + k) % n + 1
+					-- a neighbour only suppresses this node if it is itself a
+					-- candidate; a quiet node cannot veto a corner
+					if turn[j] >= lim and outranks(j, i) then best = false; break end
+				end
 			end
 			isCorner[i] = best
 		end
@@ -933,7 +965,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		-- make real ground disappear. So a ring that cannot be fitted keeps its
 		-- raw lattice outline instead. Jagged, but present.
 		-- corners first, from the ground; the fit is told where they are
-		local corner = findCorners(nrm, c)
+		local corner = findCorners(nrm, owner, c)
 		for i = 1, #corner do
 			if corner[i] and owner[i] then
 				if not owner[i].edgeCorner then stats.edgeCorners += 1 end
